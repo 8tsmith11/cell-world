@@ -26,6 +26,10 @@ export interface RenderCells {
   cellFiring: Uint8Array;
   /** Owning player of each cell (its organism's owner). */
   cellOwner: Int32Array;
+  /** Neuron outputs (-1 to 1). */
+  cellSignal: Float32Array;
+  /** Wires between cells: [source, target, weight]*. */
+  wires: Float32Array;
   /** Bonded cell pairs: [a0, b0, a1, b1, ...]. */
   bonds: Int32Array;
 }

@@ -84,6 +84,7 @@ export const ROOT = {
 export const FAT = {
   maxEnergy: 400, // much larger energy cap than other cells
   keepNeighborsAt: 0.8, // Fat takes a bonded neighbor's energy above this fraction of its cap, and gives back below it
+  reserve: 10, // energy a Fat cell keeps for itself and never gives away
 };
 
 export const SPIKE = {
@@ -104,7 +105,15 @@ export const JET = {
   minStrength: 0.01, // below this firing strength a Jet doesn't fire at all
 };
 
+export const NEURON = {
+  maxRate: 8, // per second: how fast a neuron at speed 1 moves its output toward its target
+  defaultBias: 0,
+  defaultSpeed: 0.5,
+};
+
 export const SENSOR = {
+  readDistance: 30, // world units ahead where Light, Nutrient and Temperature sensors read
+  coneHalfAngle: 60, // degrees: Proximity sensors count cells within this angle of where they face
   nutrientFull: 40, // water nutrient per tile that reads as level 1 (twice the even starting share)
   touchDistance: 2.2, // touch sensor reach, in cell radii, center to center
   proximityRange: 7, // proximity sensor range, in cell radii
@@ -114,19 +123,21 @@ export const SENSOR = {
 };
 
 export const MOUTH = {
-  drainRate: 15, // energy per second drained from each living cell a Mouth touches
+  drainRate: 30, // energy per second drained from each living cell a Mouth touches
   efficiency: 0.5, // fraction of drained energy the Mouth gains; the rest is lost
   touchDistance: 2.2, // center-to-center distance that counts as touching, in cell radii (2 = edges meet)
 };
 
 export const METABOLISM = {
   upkeep: 0.6, // energy per second per living cell at multiplier 1
+  decomposerUpkeep: 0.4, // Decomposer upkeep as a fraction of the normal upkeep
   coldMultiplier: 0.5, // upkeep multiplier at TEMPERATURE.edge
   warmMultiplier: 1.5, // upkeep multiplier at TEMPERATURE.center
 };
 
 export const BONDS = {
   stiffness: 0.6, // fraction of a bond's length error corrected per solver pass (1 = rigid)
+  shapeStiffness: 0.25, // fraction of the way each cell is pulled back toward the body's designed shape per solver pass (0 = floppy, 1 = rigid)
   energyFlowRate: 2, // fraction of the energy difference moved across a bond per second
   nutrientFlowChance: 0.2, // chance per tick that 1 stored nutrient unit moves down a bond's gradient
 };
@@ -135,6 +146,8 @@ export const GROWTH = {
   checkInterval: 10, // ticks between growth/reproduction checks per organism
   energyLoss: 0.5, // fraction of the energy spent to add a cell that is lost; the rest starts the new cell
   lostMemory: 32, // lost cell spots an organism remembers, to regrow first
+  keepEnergy: 10, // energy a cell must keep after paying for a new cell or bud (so it doesn't starve right after)
+  launchSpeed: 150, // world units per second given to offspring at launch strength 1 (water drag slows them)
 };
 
 /** Organism designs (editor) and their limits. */
@@ -150,6 +163,7 @@ export const DESIGN = {
   patternMaxRepeatsDefault: 5,
   patternMaxRepeatsMax: 12,
   fragmentPieces: 3, // pieces a Fragment organism breaks into
+  steerWeight: 0.6, // weight of the connections "steer toward/away" creates
 };
 
 export const DEAD = {
@@ -224,6 +238,7 @@ export const CELL_STYLE = {
   temperatureSensor: { color: 0xff7a5c, glow: 0xff9478, mark: 0xffe0d8, markSize: 1.7, membraneScale: 1 },
   touchSensor: { color: 0xff9ff3, glow: 0xffb8f6, mark: 0xffe8fc, markSize: 1.7, membraneScale: 1 },
   proximitySensor: { color: 0x7ae8ff, glow: 0x9aeeff, mark: 0xe0faff, markSize: 1.7, membraneScale: 1 },
+  neuron: { color: 0xd8c8ff, glow: 0xf0e8ff, mark: 0xffffff, markSize: 1.1, membraneScale: 0.85 },
   dead: { color: 0x6b7378, glow: 0x000000, mark: 0x50585c, markSize: 0.7, membraneScale: 1 },
 };
 
@@ -247,6 +262,9 @@ export const CELL_RENDER = {
   ownerOutlineAlpha: 0.8,
   bridgeWidth: 1.1, // bond bridge thickness, in cell radii
   bridgeAlpha: 0.55,
+  wireAlpha: 0.45, // in-game wiring lines between cells
+  wirePositive: 0x5ff5d2,
+  wireNegative: 0xff5c8f,
   inspectRingColor: 0xffffff,
 };
 
@@ -299,6 +317,7 @@ export const DNA = {
     temperatureSensor: 3,
     touchSensor: 3,
     proximitySensor: 3,
+    neuron: 3,
   },
 };
 
@@ -335,4 +354,15 @@ export const MUTATION = {
   nutrientNudge: 1, // max change to the nutrient needed to add a cell
   maxCellsNudge: 2, // max change to Blob max cells
   mixShift: 0.1, // fraction of the Blob mix moved from one kind to another
+  biasNudge: 0.15, // max change to a neuron's bias
+  speedNudge: 0.1, // max change to a neuron's speed
+};
+
+export const NEURON_INPUTS = {
+  speedFull: 20, // world units per second of body speed that reads as 1 (forward / sideways)
+  turnFull: 1, // radians per second of turning that reads as 1
+  eatenFull: 15, // energy per second drained from cells in range that reads as 1
+  eatenRangeMax: 8, // largest per-neuron "being eaten" range in cells; this value means the whole organism
+  noiseDrift: 0.4, // how fast the noise input wanders (per sqrt-second)
+  noisePull: 0.3, // how strongly noise drifts back toward 0 (per second)
 };

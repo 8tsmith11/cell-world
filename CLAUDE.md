@@ -84,7 +84,7 @@ Rules:
 - Cells are circles of one fixed size.
 - Cell types for now: **Leaf**, **Mouth**, **Root**, **Fat**, **Spike**,
   **Decomposer**, **Jet**, five sensors (**Light**, **Nutrient**,
-  **Temperature**, **Touch**, **Proximity**) and **Dead**.
+  **Temperature**, **Touch**, **Proximity**), **Neuron** and **Dead**.
 - Leaf gains energy from the light at its position.
 - Every living cell (all types) pays energy upkeep each tick, scaled by
   temperature.
@@ -95,7 +95,7 @@ Rules:
 Mouth rules:
 - Drifts with currents like other cells.
 - While a Mouth touches a living cell, it drains that cell's energy at a fixed
-  rate. Touching means the cells overlap or are within touching distance
+  rate (`MOUTH.drainRate`, 30/s). Touching means the cells overlap or are within touching distance
   (contact checks use the spatial grid).
 - The Mouth gains only a fraction of the drained energy (efficiency in
   `config.ts`); the rest is lost.
@@ -119,14 +119,17 @@ Root, Fat, Spike, Decomposer, Jet:
 - **Fat**: has a high energy cap, so the organism can store extra energy. It
   acts as a reservoir: it takes a bonded neighbor's energy above a keep level
   (a fraction of the neighbor's cap) and gives energy back when the neighbor
-  drops below it.
+  drops below it, but never gives away its own small reserve.
 - **Spike**: drains energy from every living cell it touches that isn't part
   of its own organism. The Spike gains nothing. A drained cell that reaches
   zero energy dies (becomes Dead) as usual.
 - **Decomposer**: eats Dead cells it touches: takes their nutrient into its
-  stored nutrient (up to its cap) and gains a small amount of energy per unit.
+  stored nutrient and gains a small amount of energy per unit. It always eats
+  while touching one; nutrient above its store cap goes into the water at its
+  position.
   The Dead cell is removed once its nutrient is gone. Does not eat living
-  cells.
+  cells. Pays reduced upkeep (`METABOLISM.decomposerUpkeep`, a fraction of
+  the normal upkeep).
 - **Jet**: its exhaust points outward from the cell it's attached to (its
   earliest-placed neighbor in the design: the cell it grew from; for a starter,
   its first neighbor placed after it), and it pushes the organism the opposite
@@ -136,30 +139,52 @@ Root, Fat, Spike, Decomposer, Jet:
   A Jet only produces thrust if the hex in its exhaust direction has no cell
   of its own organism; a blocked Jet produces no thrust and spends no firing
   energy. The editor marks blocked Jets with a warning style.
-  Control by behavior comes later.
 
-Sensor cells (each reads only at its own position; all pay upkeep scaled by
-temperature like other cells):
+Sensor cells (all pay upkeep scaled by temperature like other cells):
+- Every sensor is directional: like a Jet, it faces outward from the cell it's
+  attached to.
 - **Light sensor**: light level. **Nutrient sensor**: nutrient in the water.
-  **Temperature sensor**: temperature.
+  **Temperature sensor**: temperature. These three read at a point a set
+  distance ahead in the direction they face (`SENSOR.readDistance`).
 - **Touch sensor**: whether it's touching a living cell of another organism.
 - **Proximity sensor**: how many living cells of other organisms are within a
-  short range. Each Proximity sensor has a filter set in the editor: any cell,
-  or one chosen cell type; it counts only matching cells.
+  short range and inside a cone ahead (`SENSOR.coneHalfAngle`). Each Proximity
+  sensor has a filter set in the editor: any cell, or one chosen cell type; it
+  counts only matching cells.
 - Each sensor gives two outputs: **level**, its current reading normalized to
   0-1, and **change**, whether the reading is rising or falling over a short
   recent window (the level minus its recent moving average, scaled), -1 to 1.
 
+**Neuron** cell:
+- Takes wired inputs and produces an output from -1 to 1:
+  target = tanh(bias + sum of (weight × input)). The output moves toward the
+  target at the neuron's own speed (0 to 1; slow neurons hold state).
+- All inputs use the previous tick's outputs, so loops (including a neuron
+  wired to itself) are well defined.
+- Internal inputs, each with its own weight (-1 to 1) set on the neuron:
+  - **Velocity**: forward, sideways and turning speed relative to the body
+    (forward = the way its Jets push overall).
+  - **Being eaten**: energy drained by Mouths or Spikes from cells within the
+    neuron's range (a number of cells, up to the whole organism).
+  - **Energy**: the organism's stored energy as a fraction of capacity.
+  - **Nutrient**: stored nutrient as a fraction of capacity.
+  - **Size**: cells as a fraction of max cells.
+  - **Noise**: a slowly drifting random value.
+- Bias and speed are set per neuron in the editor (defaults in `config.ts`).
+
 Behavior wiring:
-- Sensors connect to Jets. A sensor can connect to any number of Jets, and a
-  Jet can receive any number of connections. Each connection has a weight
-  from -1 to 1 and uses either the sensor's level or change output.
+- Sources: sensor outputs (level or change) and neuron outputs. Targets: Jets
+  and Neurons. Any source connects to any number of targets, and any target
+  takes any number of connections. Each connection has a weight from -1 to 1.
 - A Jet's firing strength = its base strength + the sum of (weight × input)
   from its connections, clamped to 0-1 (below a tiny minimum it doesn't fire).
-- Wiring only applies to Form designs for now (other growth types ignore it
-  and fire at their base strength). Wires refer to body slots; each cell
-  remembers which slot it fills, so a Jet finds its sensors in its own
-  organism.
+- Wiring applies to Form and Pattern designs (Blob ignores it). Wires refer to
+  body slots; each cell remembers which slot it fills, so a target finds its
+  sources in its own organism.
+- Pattern: wiring drawn in the motif is copied into every repeat. Each
+  connection's target is in the same repeat, the previous repeat (the one this
+  repeat attached to), or the next repeats (every repeat attached to this
+  one).
 
 Resource flow:
 - Leaves (and Roots, faster) absorb nutrient from the water at their position
@@ -170,7 +195,8 @@ Resource flow:
   toward equal fullness relative to each cell's cap, so a Root's big store
   backs up the body.
 - Growth and reproduction spend stored energy and stored nutrient: adding a
-  cell costs the design's energy and nutrient at the cell that grows it. The
+  cell costs the design's energy and nutrient at the cell that grows it, which
+  must keep a small energy reserve afterwards. The
   nutrient becomes the new body (any surplus starts its store); part of the
   energy is lost and the rest starts the new cell.
 - Nutrient stays conserved.
@@ -179,6 +205,9 @@ Bonds:
 - Bonds connect cells directly: cell A, cell B, rest length. Every pair of
   neighboring cells in an organism's hex layout is bonded.
 - Stiff constraints that don't fully correct each step, so the body can flex.
+  Each organism is also pulled part of the way back toward its designed shape
+  every step (best-fit rotation and position of its hex layout), so bodies
+  hold their orientation and spring back after bending, with some give.
 - A bond breaks when either cell dies or is eaten.
 - If an organism becomes disconnected, each connected piece becomes its own
   organism with the same genome.
@@ -209,6 +238,9 @@ Genome (per organism; compiled from a design made in the editor):
   Pattern allow all three.
 - Reproduces when it reaches max size and has enough stored energy and
   nutrient.
+- Launch (0-1, set in the editor's Reproduction tab): offspring are shot away
+  from the parent: a Bud from the cell it budded from, Split/Fragment pieces
+  from the parent piece's center. 0 = no launch.
 - Built-in single-cell designs "Leaf" and "Mouth" (Form + Bud) are always
   available.
 
@@ -224,7 +256,11 @@ Cell rendering:
 - Decomposer: murky olive-green glow with a swirl mark.
 - Jet: bright blue glow, a chevron pointing the way it pushes, and a small
   flickering exhaust trail while firing.
-- Sensors: each has its own color and a small antenna-like mark.
+- Sensors: each has its own color and a small antenna-like mark pointing the
+  way it faces.
+- Neuron: a small bright node whose glow follows its output (tinted by sign).
+- Wires are drawn in game as thin lines between connected cells, colored by
+  positive or negative weight.
 - Dead: dull gray, no glow, slowly fading.
 - A brief pulsing cue on a cell while a Mouth, Spike or Decomposer drains it.
 - Bonded cells are joined by a soft bridge in their colors.
@@ -236,17 +272,24 @@ Cell rendering:
 - Body tab: place Leaf, Mouth, Root, Fat, Spike, Decomposer, Jet and the five
   sensor cells (each must touch an earlier one). The first cell is the starter. For Form,
   each cell shows its growth order. Each Jet shows an arrow for the direction
-  it pushes, and has its own strength slider. Each Proximity sensor has a type
-  filter (any cell, or one cell type).
+  it pushes, and has its own strength slider. Each sensor shows an arrow for
+  the way it faces. Each Proximity sensor has a type filter (any cell, or one
+  cell type). Each Neuron has bias, speed, internal-input weight and
+  being-eaten range sliders.
 - Growth tab: growth type and its settings (energy and nutrient per new cell;
   Blob max cells, with the cell mix shown from the body; Pattern max repeats and the motif
   editor, where the player marks the start cell and end points).
-- Reproduction tab: reproduction type, limited by growth type, and the
-  mutation rate slider.
-- Behavior tab (Form only): click a sensor, then a Jet, to connect them. Each
-  connection has a weight slider and a level/change toggle. Connections show
-  as lines between cells, colored by positive or negative weight (dashed for
-  change).
+- Reproduction tab: reproduction type, limited by growth type, the launch
+  slider, and the mutation rate slider.
+- Behavior tab (Form and Pattern): click a source (sensor or neuron), then a
+  target (Jet or neuron) to connect them; clicking a neuron twice wires it to
+  itself. Each connection has a weight slider, a level/change toggle for
+  sensor sources, and for Pattern a target picker (same, previous or next
+  repeat). Connections show as lines between cells, colored by positive or
+  negative weight (dashed for change).
+- On any sensor, "Steer toward" and "Steer away" buttons replace that sensor's
+  Jet connections with wiring that turns the organism toward or away from the
+  sensor's side. These are normal, editable connections.
 - Preview animates the design growing from its starter cell. Stats: cell
   count, upkeep per tick, nutrient needed to grow, nutrient needed to
   reproduce.
@@ -307,13 +350,15 @@ Cell rendering:
   middle). It scales all mutation chances (the middle = base rates, 0 = exact
   copies) and is inherited by offspring.
 - Small, frequent mutations: nudge wiring weights; nudge Jet base strength;
+  nudge neuron bias and speed;
   nudge Blob max cells and the energy and nutrient needed to add a cell;
   Blob: shift cell mix proportions between kinds it already uses (a genome
   can carry its own mix weights, starting from the body's mix); Pattern:
   change the repeat count.
 - Rare, structural mutations: change a cell's type; add a cell on the edge of
   a Form or a Pattern motif; remove a cell, only if the design stays
-  connected; add or remove a wiring connection.
+  connected; add or remove a wiring connection (between any source and
+  target, including to and from neurons).
 - Each mutation is kept only if the design stays valid. Mutated offspring stay
   in the same lineage and owner.
 - Hover info shows an organism's generation (released = 1, +1 per
@@ -406,6 +451,9 @@ Cell rendering:
   outputs, sensor-to-Jet wiring in the editor (Form designs).
 - [x] **Step 10 — Mutation**: per-organism genomes, mutation on reproduction,
   generation and mutation counts, saving an evolved individual as a design.
+- [x] **Step 11 — Neurons**: directional sensors, Neuron cells with internal
+  inputs, general wiring (sensors/neurons to Jets/neurons) for Form and
+  Pattern, steer toward/away, wires rendered in game.
 
 ## Layout
 

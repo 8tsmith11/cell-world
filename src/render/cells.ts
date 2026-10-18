@@ -2,7 +2,7 @@ import { Container, Graphics, Sprite, Texture } from 'pixi.js';
 import { AdvancedBloomFilter } from 'pixi-filters';
 import { CELL, CELL_RENDER, CELL_STYLE } from '../config';
 import type { RenderCells } from '../game-source';
-import { CellType, energyCap, TYPE_STYLE } from '../sim/sim';
+import { CellType, energyCap, isSensorType, TYPE_STYLE } from '../sim/sim';
 
 /** Builds a texture from a per-pixel function of normalized coords in [-1, 1] returning [gray, alpha]. */
 function makeTexture(size: number, pixel: (u: number, v: number) => [number, number]): Texture {
@@ -125,6 +125,11 @@ function buildTextures() {
       temperatureSensor: antenna,
       touchSensor: antenna,
       proximitySensor: antenna,
+      // Neuron: a small bright node.
+      neuron: makeTexture(32, (u, v) => {
+        const d = Math.hypot(u, v);
+        return [1, Math.max(0, 1 - d / 0.55) ** 1.2 + ring(u, v, 0.75, 0.12) * 0.6];
+      }),
     },
     // Jet exhaust: bright where it leaves the Jet (left end), fading outward.
     exhaust: makeTexture(64, (u, v) => [1, ((1 - u) / 2) ** 1.4 * Math.max(0, 1 - v * v * 1.6)]),
@@ -198,6 +203,7 @@ const MARK_BLEND: Record<StyleKey, 'normal' | 'add'> = {
   temperatureSensor: 'add',
   touchSensor: 'add',
   proximitySensor: 'add',
+  neuron: 'add',
   dead: 'normal',
 };
 
@@ -212,6 +218,7 @@ export class CellView {
   private drainCues: SpritePool;
   private glows: SpritePool;
   private ring = new Graphics();
+  private wireLines = new Graphics();
 
   constructor() {
     const bridgeLayer = new Container();
@@ -238,14 +245,14 @@ export class CellView {
     this.exhausts = new SpritePool(cueLayer, tex.exhaust, 'add');
     this.drainCues = new SpritePool(cueLayer, tex.drain, 'add');
     this.glows = new SpritePool(glowLayer, tex.glow, 'add');
-    this.container.addChild(bridgeLayer, membraneLayer, marksLayer, cueLayer, glowLayer, this.ring);
+    this.container.addChild(this.wireLines, bridgeLayer, membraneLayer, marksLayer, cueLayer, glowLayer, this.ring);
   }
 
   /** `ownerColor` gives each player's color, for the thin outline on their organisms. */
   draw(frame: RenderCells, daylight: number, inspectId: number, zoom: number, ownerColor: (owner: number) => number): void {
     const r = CELL.radius;
     const glowAlpha = CELL_RENDER.glowDay + (CELL_RENDER.glowNight - CELL_RENDER.glowDay) * (1 - daylight);
-    const { cellType, cellX, cellY, cellAngle, cellEnergy, cellNutrient, cellDrained, cellFiring, cellOwner } = frame;
+    const { cellType, cellX, cellY, cellAngle, cellEnergy, cellNutrient, cellDrained, cellFiring, cellOwner, cellSignal } = frame;
     const now = performance.now() / 1000;
     const pulse = 0.55 + 0.45 * Math.sin(now * Math.PI * 2 * CELL_RENDER.drainPulseHz);
     const pools = [this.bridges, this.outlines, this.membranes, ...Object.values(this.marks), this.exhausts, this.drainCues, this.glows];
@@ -265,11 +272,20 @@ export class CellView {
       } else {
         this.outlines.next(x, y, r * CELL_RENDER.ownerOutlineSize * style.membraneScale, ownerColor(cellOwner[i]), CELL_RENDER.ownerOutlineAlpha);
         this.membranes.next(x, y, 2 * r * style.membraneScale, style.color, 1);
-        // A Jet's angle is its exhaust direction; its chevron points the way it pushes.
-        const rotation = type === CellType.Jet ? cellAngle[i] + Math.PI : cellAngle[i];
-        this.marks[key].next(x, y, r * style.markSize, style.mark, 0.9, rotation);
-        const vigor = 0.4 + 0.6 * Math.min(1, cellEnergy[i] / energyCap(type));
-        this.glows.next(x, y, 2 * r * CELL_RENDER.glowRadius, style.glow, glowAlpha * vigor);
+        // A Jet's and sensor's angle is the way it faces (outward): a Jet's chevron
+        // points the way it pushes; a sensor's antennae (drawn pointing up) point where it faces.
+        const rotation = type === CellType.Jet ? cellAngle[i] + Math.PI : isSensorType(type) ? cellAngle[i] + Math.PI / 2 : cellAngle[i];
+        if (type === CellType.Neuron) {
+          // The node and its glow follow the neuron's output; tint shows its sign.
+          const level = Math.abs(cellSignal[i]);
+          const tint = cellSignal[i] >= 0 ? CELL_RENDER.wirePositive : CELL_RENDER.wireNegative;
+          this.marks.neuron.next(x, y, r * style.markSize * (0.7 + 0.6 * level), level > 0.05 ? blend(style.mark, tint) : style.mark, 0.35 + 0.65 * level);
+          this.glows.next(x, y, 2 * r * CELL_RENDER.glowRadius, style.glow, Math.max(glowAlpha, 0.25) * (0.2 + 1.2 * level));
+        } else {
+          this.marks[key].next(x, y, r * style.markSize, style.mark, 0.9, rotation);
+          const vigor = 0.4 + 0.6 * Math.min(1, cellEnergy[i] / energyCap(type));
+          this.glows.next(x, y, 2 * r * CELL_RENDER.glowRadius, style.glow, glowAlpha * vigor);
+        }
       }
       if (cellFiring[i]) {
         // Flickering exhaust trail behind the Jet.
@@ -311,6 +327,20 @@ export class CellView {
       );
     }
     for (const p of pools) p.end();
+
+    // Wiring: thin lines from source to target, colored by the sign of the weight.
+    const g = this.wireLines;
+    g.clear();
+    const { wires } = frame;
+    for (let k = 0; k < wires.length; k += 3) {
+      const a = wires[k];
+      const b = wires[k + 1];
+      if (a >= frame.cellCount || b >= frame.cellCount || !cellType[a] || !cellType[b] || a === b) continue;
+      const w = wires[k + 2];
+      g.moveTo(cellX[a], cellY[a])
+        .lineTo(cellX[b], cellY[b])
+        .stroke({ width: (0.8 + Math.abs(w) * 1.2) / zoom, color: w >= 0 ? CELL_RENDER.wirePositive : CELL_RENDER.wireNegative, alpha: CELL_RENDER.wireAlpha * (0.4 + 0.6 * Math.abs(w)) });
+    }
 
     this.ring.clear();
     if (inspectId >= 0 && inspectId < frame.cellCount && cellType[inspectId] !== CellType.None) {

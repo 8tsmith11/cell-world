@@ -8,7 +8,7 @@ import { Streaks } from './render/streaks';
 import { OVERLAYS, Water, type Overlay } from './render/water';
 import { sampleCurrent } from './sim/currents';
 import type { CellInfo } from './sim/protocol';
-import { CELL_TYPE_NAMES, energyCap, storedCap } from './sim/sim';
+import { CELL_TYPE_NAMES, CellType, energyCap, storedCap } from './sim/sim';
 import { dayPhase, daylight } from './sim/world';
 
 const css = (hex: number) => `#${hex.toString(16).padStart(6, '0')}`;
@@ -55,6 +55,10 @@ function cellLines(c: CellInfo): string[] {
     `angle      ${c.angle.toFixed(2)}`,
     `organism   ${c.organism}`,
   ];
+  if (c.type >= CellType.LightSensor && c.type <= CellType.ProximitySensor) {
+    lines.push(`level      ${c.sensorLevel.toFixed(2)}`, `change     ${c.sensorChange >= 0 ? '+' : ''}${c.sensorChange.toFixed(2)}`);
+  }
+  if (c.type === CellType.Neuron) lines.push(`output     ${c.neuronOutput >= 0 ? '+' : ''}${c.neuronOutput.toFixed(2)}`);
   if (c.org) {
     lines.push(
       `owner      ${c.org.owner}`,

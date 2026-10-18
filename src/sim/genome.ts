@@ -1,6 +1,6 @@
 // Organism designs (what players build in the editor) and the genomes compiled
 // from them. DOM-free: used by the simulation worker and the editor alike.
-import { CELL, DESIGN, DNA, JET } from '../config';
+import { CELL, DESIGN, DNA, JET, NEURON } from '../config';
 
 // ------------------------------------------------------------- hex grid
 // Axial coordinates (q, r), pointy-top. Neighbor centers are one cell diameter apart.
@@ -58,21 +58,32 @@ export function areNeighbors(q1: number, r1: number, q2: number, r2: number): bo
 // ------------------------------------------------------------- designs
 
 export const SENSOR_KINDS = ['lightSensor', 'nutrientSensor', 'temperatureSensor', 'touchSensor', 'proximitySensor'] as const;
-export const CELL_KINDS = ['leaf', 'mouth', 'root', 'fat', 'spike', 'decomposer', 'jet', ...SENSOR_KINDS] as const;
+export const CELL_KINDS = ['leaf', 'mouth', 'root', 'fat', 'spike', 'decomposer', 'jet', ...SENSOR_KINDS, 'neuron'] as const;
 export type CellKind = (typeof CELL_KINDS)[number];
 export const isSensor = (k: CellKind) => (SENSOR_KINDS as readonly string[]).includes(k);
+/** Cells whose outputs can drive others: sensors and neurons. */
+export const isSource = (k: CellKind) => isSensor(k) || k === 'neuron';
+/** Cells that take wired inputs: Jets and neurons. */
+export const isTarget = (k: CellKind) => k === 'jet' || k === 'neuron';
+
+/** Neuron internal inputs, each with its own weight set on the neuron. */
+export const NEURON_INPUT_KEYS = ['forward', 'sideways', 'turning', 'eaten', 'energy', 'nutrient', 'size', 'noise'] as const;
+export type NeuronInput = (typeof NEURON_INPUT_KEYS)[number];
 
 /**
- * Behavior wiring: a sensor (index into the body) drives a Jet (index into the
- * body). The Jet's strength = its base + sum of weight × input, clamped to 0-1.
+ * Behavior wiring: a source (sensor or neuron, index into the body) drives a
+ * target (Jet or neuron). A Jet's strength = its base + sum of weight × input,
+ * clamped to 0-1; a neuron's target = tanh(bias + sum of weight × input + internal inputs).
  */
 export interface Wire {
-  sensor: number;
-  jet: number;
+  source: number;
+  target: number;
   /** -1 to 1. */
   weight: number;
-  /** Which sensor output: its level (0 to 1) or its change (-1 to 1). */
+  /** For sensor sources: its level (0 to 1) or its change (-1 to 1). Neurons have one output. */
   output: 'level' | 'change';
+  /** Pattern only: whether the target is in the same repeat, the previous one, or the next ones. */
+  repeat?: 'same' | 'previous' | 'next';
 }
 export type GrowthType = 'form' | 'blob' | 'pattern';
 export type ReproductionType = 'split' | 'bud' | 'fragment';
@@ -85,6 +96,11 @@ export interface DesignCell {
   strength?: number;
   /** Proximity sensor only: count only cells of this type (absent = any cell). */
   filter?: CellKind;
+  /** Neuron only: bias, speed (0-1) of moving toward its target, internal input weights, and "being eaten" range in cells. */
+  bias?: number;
+  speed?: number;
+  inputs?: Partial<Record<NeuronInput, number>>;
+  eatenRange?: number;
   /**
    * Set when compiled into a plan: hex direction (index into HEX_DIRS) from
    * this cell to the cell it's attached to, or -1. A Jet pushes that way.
@@ -130,10 +146,12 @@ export interface Design {
   /** Pattern: indices into `cells`. */
   pattern: { start: number; ends: number[]; maxRepeats: number };
   reproduction: ReproductionType;
-  /** Behavior wiring between sensors and Jets. Only applies to Form designs for now. */
+  /** Behavior wiring from sensors and neurons to Jets and neurons. Applies to Form and Pattern designs. */
   wiring?: Wire[];
   /** 0-1 (default in the middle); scales all mutation chances. Inherited by offspring. */
   mutationRate?: number;
+  /** 0-1: how hard offspring are launched away when it buds, splits or fragments (0 = no launch). */
+  launch?: number;
   /** Stored energy and nutrient a cell spends to add one cell. */
   growEnergy: number;
   growNutrient: number;
@@ -162,8 +180,23 @@ export function singleCellDesign(name: string, kind: CellKind): Design {
 /** Built-in single-cell designs, always available. */
 export const BUILTIN_DESIGNS: Design[] = [singleCellDesign('Leaf', 'leaf'), singleCellDesign('Mouth', 'mouth')];
 
+/** Upgrades designs saved before wiring had general sources and targets ({sensor, jet} wires). */
+export function normalizeDesign(d: Design): Design {
+  if (d.wiring?.some((w) => (w as unknown as { sensor?: number }).sensor !== undefined)) {
+    d.wiring = d.wiring.map((w) => {
+      const old = w as unknown as { sensor?: number; jet?: number };
+      return old.sensor !== undefined ? { source: old.sensor, target: old.jet!, weight: w.weight, output: w.output } : w;
+    });
+  }
+  return d;
+}
+
+export const neuronBias = (c: DesignCell) => c.bias ?? NEURON.defaultBias;
+export const neuronSpeed = (c: DesignCell) => c.speed ?? NEURON.defaultSpeed;
+
 /** Returns a reason the design can't be used, or null if it's valid. */
 export function validateDesign(d: Design): string | null {
+  normalizeDesign(d);
   if (!d.cells.length) return 'Place at least one cell.';
   if (d.cells.length > DESIGN.maxCells) return `A body can have at most ${DESIGN.maxCells} cells.`;
   const seen = new Set<number>();
@@ -180,9 +213,16 @@ export function validateDesign(d: Design): string | null {
   if (d.cells.some((c) => c.strength !== undefined && !(c.strength >= 0 && c.strength <= 1))) return 'Jet strength must be between 0 and 1.';
   if (d.cells.some((c) => c.filter !== undefined && !(CELL_KINDS as readonly string[]).includes(c.filter))) return 'Unknown proximity sensor filter.';
   for (const w of d.wiring ?? []) {
-    if (!d.cells[w.sensor] || !isSensor(d.cells[w.sensor].kind) || d.cells[w.jet]?.kind !== 'jet') return 'A connection must join a sensor to a Jet.';
+    if (!d.cells[w.source] || !isSource(d.cells[w.source].kind) || !d.cells[w.target] || !isTarget(d.cells[w.target].kind)) {
+      return 'A connection must run from a sensor or neuron to a Jet or neuron.';
+    }
     if (!(w.weight >= -1 && w.weight <= 1)) return 'Connection weights must be between -1 and 1.';
   }
+  for (const c of d.cells) {
+    if (c.speed !== undefined && !(c.speed >= 0 && c.speed <= 1)) return 'Neuron speed must be between 0 and 1.';
+    if (c.bias !== undefined && !(c.bias >= -1 && c.bias <= 1)) return 'Neuron bias must be between -1 and 1.';
+  }
+  if (d.launch !== undefined && !(d.launch >= 0 && d.launch <= 1)) return 'Launch strength must be between 0 and 1.';
   if (d.growNutrient < CELL.bodyNutrient) return `Each new cell needs at least ${CELL.bodyNutrient} nutrient for its body.`;
   if (d.growth === 'blob' && d.blob.maxCells < d.cells.length) return 'Max cells must be at least the body size.';
   if (d.growth === 'pattern') {
@@ -196,34 +236,77 @@ export function validateDesign(d: Design): string | null {
 
 // ------------------------------------------------------------- genomes
 
+/** A compiled connection into a target plan slot. */
+export interface SlotWire {
+  /** Source plan slot. */
+  source: number;
+  weight: number;
+  /** Use the sensor's change output (sensor sources only). */
+  change: boolean;
+}
+
 export interface Genome {
   design: Design;
-  /** Behavior wiring by Jet plan slot (Form designs only; empty otherwise). */
-  wires: Map<number, { sensor: number; weight: number; change: boolean }[]>;
+  /** Behavior wiring by target plan slot (Form and Pattern designs; empty otherwise). */
+  wires: Map<number, SlotWire[]>;
   /** Ordered slots to grow (organism-local hex positions). plan[0] is the starter. */
   plan: DesignCell[];
   /** Size at which the organism stops growing and can reproduce. */
   maxCells: number;
+  /** Body-frame "forward" (layout units): the way its Jets push overall, or +x without Jets. */
+  forward: [number, number];
+}
+
+function forwardOf(plan: DesignCell[]): [number, number] {
+  let fx = 0;
+  let fy = 0;
+  for (const c of plan) {
+    if (c.kind !== 'jet' || c.push === undefined || c.push < 0) continue;
+    const [x, y] = hexToLocal(...HEX_DIRS[c.push]);
+    fx += x;
+    fy += y;
+  }
+  const len = Math.hypot(fx, fy);
+  return len > 1e-6 ? [fx / len, fy / len] : [1, 0];
 }
 
 /** Turns a design into the plan its organisms grow. */
 export function compileGenome(design: Design): Genome {
-  const wires = new Map<number, { sensor: number; weight: number; change: boolean }[]>();
+  normalizeDesign(design);
+  const wires = new Map<number, SlotWire[]>();
+  const addWire = (target: number, wire: SlotWire) => {
+    let list = wires.get(target);
+    if (!list) wires.set(target, (list = []));
+    list.push(wire);
+  };
   if (design.growth === 'pattern') {
-    const plan = withAttachments(patternPlan(design));
-    return { design, plan, maxCells: plan.length, wires };
+    const { plan: raw, repeats } = patternPlan(design);
+    const plan = withAttachments(raw);
+    // Wiring drawn in the motif is copied into every repeat. Targets can be in
+    // the same repeat, the previous one (the one it attached to), or the next
+    // ones (every repeat attached to it).
+    for (const rep of repeats) {
+      for (const w of design.wiring ?? []) {
+        const source = rep.slots[w.source];
+        if (source < 0) continue;
+        const where = w.repeat ?? 'same';
+        const into =
+          where === 'same' ? [rep] : where === 'previous' ? (rep.parent >= 0 ? [repeats[rep.parent]] : []) : rep.children.map((c) => repeats[c]);
+        for (const r of into) {
+          const target = r.slots[w.target];
+          if (target >= 0) addWire(target, { source, weight: w.weight, change: w.output === 'change' });
+        }
+      }
+    }
+    return { design, plan, maxCells: plan.length, wires, forward: forwardOf(plan) };
   }
   // For Form and Blob the plan is the body in order, so plan slot = body index.
   const plan = withAttachments(design.cells.map((c) => ({ ...c })));
   const maxCells = design.growth === 'blob' ? Math.min(DESIGN.maxCells, design.blob.maxCells) : plan.length;
   if (design.growth === 'form') {
-    for (const w of design.wiring ?? []) {
-      let list = wires.get(w.jet);
-      if (!list) wires.set(w.jet, (list = []));
-      list.push({ sensor: w.sensor, weight: w.weight, change: w.output === 'change' });
-    }
+    for (const w of design.wiring ?? []) addWire(w.target, { source: w.source, weight: w.weight, change: w.output === 'change' });
   }
-  return { design, plan, maxCells, wires };
+  return { design, plan, maxCells, wires, forward: forwardOf(plan) };
 }
 
 /**
@@ -233,7 +316,14 @@ export function compileGenome(design: Design): Genome {
  * repeat, cells are ordered outward from the start so each touches an earlier
  * one. Spots already taken are skipped.
  */
-function patternPlan(d: Design): DesignCell[] {
+interface Repeat {
+  /** Plan slot of each motif cell in this repeat (-1 where the spot was already taken). */
+  slots: number[];
+  parent: number;
+  children: number[];
+}
+
+function patternPlan(d: Design): { plan: DesignCell[]; repeats: Repeat[] } {
   const motif = d.cells;
   const s = motif[d.pattern.start];
   const rel = motif.map((c) => [c.q - s.q, c.r - s.r] as [number, number]);
@@ -241,12 +331,15 @@ function patternPlan(d: Design): DesignCell[] {
   const mainDir = nearestHexDir(...rel[d.pattern.ends[0]]);
   const plan: DesignCell[] = [];
   const taken = new Set<number>();
-  // Each queued repeat: rotation (60° steps) and where its start cell goes.
-  const queue: { rot: number; q: number; r: number }[] = [{ rot: 0, q: s.q, r: s.r }];
-  let repeats = 0;
-  while (queue.length && repeats < Math.max(1, d.pattern.maxRepeats) && plan.length < DESIGN.maxCells) {
+  const repeats: Repeat[] = [];
+  // Each queued repeat: rotation (60° steps), where its start cell goes, and the repeat it attaches to.
+  const queue: { rot: number; q: number; r: number; parent: number }[] = [{ rot: 0, q: s.q, r: s.r, parent: -1 }];
+  while (queue.length && repeats.length < Math.max(1, d.pattern.maxRepeats) && plan.length < DESIGN.maxCells) {
     const rep = queue.shift()!;
-    repeats++;
+    const index = repeats.length;
+    const slots = motif.map(() => -1);
+    repeats.push({ slots, parent: rep.parent, children: [] });
+    if (rep.parent >= 0) repeats[rep.parent].children.push(index);
     for (const i of order) {
       const [dq, dr] = hexRotate(...rel[i], rep.rot);
       const q = rep.q + dq;
@@ -254,16 +347,19 @@ function patternPlan(d: Design): DesignCell[] {
       const k = hexKey(q, r);
       if (taken.has(k) || plan.length >= DESIGN.maxCells) continue;
       taken.add(k);
-      plan.push({ q, r, kind: motif[i].kind, strength: motif[i].strength });
+      // Copy the motif cell's own settings (Jet strength, sensor filter, neuron settings).
+      const { q: _q, r: _r, ...settings } = motif[i];
+      slots[i] = plan.length;
+      plan.push({ ...settings, q, r });
     }
     for (const e of d.pattern.ends) {
       const [eq, er] = hexRotate(...rel[e], rep.rot);
       const dir = nearestHexDir(eq, er);
       const [sq, sr] = HEX_DIRS[dir];
-      queue.push({ rot: rep.rot + (nearestHexDir(...rel[e]) - mainDir), q: rep.q + eq + sq, r: rep.r + er + sr });
+      queue.push({ rot: rep.rot + (nearestHexDir(...rel[e]) - mainDir), q: rep.q + eq + sq, r: rep.r + er + sr, parent: index });
     }
   }
-  return plan;
+  return { plan, repeats };
 }
 
 /**

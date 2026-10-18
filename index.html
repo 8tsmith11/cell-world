@@ -183,6 +183,13 @@
       .wire-toggle { display: flex; gap: 6px; }
       .wire-toggle button { padding: 3px 10px !important; color: var(--dim) !important; }
       .wire-toggle button.active { color: var(--accent) !important; border-color: var(--glow) !important; }
+      .sensor-arrow line, .sensor-arrow polyline { stroke: #fffbe0; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; opacity: 0.85; }
+      .wire-repeat { fill: #e6fff9; font: 600 10px ui-monospace, monospace; text-anchor: middle; pointer-events: none; }
+      .wire-sep { color: var(--dim); align-self: center; margin-left: 6px; }
+      .steer-row { align-items: center; flex-wrap: wrap; }
+      .steer-row .wire-name { min-width: 9em; }
+      .neuron-settings { border: 1px solid var(--edge); border-radius: 8px; padding: 6px 8px; }
+      .neuron-settings summary { cursor: pointer; color: var(--accent); }
       .jet-blocked { fill: none; stroke: #ffb02e; stroke-width: 2.5; stroke-dasharray: 4 3; filter: drop-shadow(0 0 4px rgba(255, 140, 40, 0.9)); }
       .jet-arrow.blocked line, .jet-arrow.blocked polyline { stroke: #ffb02e !important; opacity: 0.55; }
       .editor-slider.blocked span { color: #ffb02e; }

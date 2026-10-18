@@ -45,6 +45,9 @@ function inspect(s: Sim, i: number): CellInfo | null {
     storedNutrient: s.storedNutrient[i],
     age: s.age[i],
     organism: o,
+    sensorLevel: s.sensorLevel[i],
+    sensorChange: s.sensorChange[i],
+    neuronOutput: s.neuronOut[i],
     org:
       o < 0
         ? null
@@ -100,6 +103,8 @@ function postFrame(s: Sim): void {
     cellNutrient: s.bodyNutrient.slice(0, n),
     cellDrained: s.drained.slice(0, n),
     cellFiring: s.firing.slice(0, n),
+    cellSignal: s.neuronOut.slice(0, n),
+    wires: s.wireList(),
     bonds: bondPairs(s),
     cellOrganism: s.organism.slice(0, n),
     cellLineage: s.cellLineage.slice(0, n),
@@ -122,6 +127,8 @@ function postFrame(s: Sim): void {
     msg.cellNutrient.buffer,
     msg.cellDrained.buffer,
     msg.cellFiring.buffer,
+    msg.cellSignal.buffer,
+    msg.wires.buffer,
     msg.bonds.buffer,
     msg.cellOrganism.buffer,
     msg.cellLineage.buffer,

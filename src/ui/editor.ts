@@ -1,10 +1,17 @@
-import { CELL, CELL_STYLE, DESIGN, JET, METABOLISM, MUTATION, SIM } from '../config';
+import { CELL, CELL_STYLE, DESIGN, JET, METABOLISM, MUTATION, NEURON_INPUTS, SIM } from '../config';
 import {
   ALLOWED_REPRODUCTION,
   areNeighbors,
   attachDirection,
   bodyMix,
   isSensor,
+  isSource,
+  isTarget,
+  NEURON_INPUT_KEYS,
+  type NeuronInput,
+  neuronBias,
+  neuronSpeed,
+  type Wire,
   jetBlocked,
   releaseCost,
   CELL_KINDS,
@@ -43,6 +50,17 @@ const KIND_LABEL: Record<CellKind, string> = {
   temperatureSensor: 'Temp sensor',
   touchSensor: 'Touch sensor',
   proximitySensor: 'Proximity sensor',
+  neuron: 'Neuron',
+};
+const INPUT_LABEL: Record<NeuronInput, string> = {
+  forward: 'Forward speed',
+  sideways: 'Sideways speed',
+  turning: 'Turning speed',
+  eaten: 'Being eaten',
+  energy: 'Energy',
+  nutrient: 'Nutrient',
+  size: 'Size',
+  noise: 'Noise',
 };
 /** Circle style for a cell kind: translucent fill, bright rim, soft glow. */
 const cellStyle = (k: CellKind) =>
@@ -92,8 +110,10 @@ export class Editor {
   private saved: Design[] = loadDesigns();
   private tab: Tab = 'body';
   private tool: Tool = 'leaf';
-  /** Behavior tab: the sensor picked first, waiting for a Jet to connect to. */
+  /** Behavior tab: the source (sensor or neuron) picked first, waiting for a target. */
   private pendingSensor: number | null = null;
+  /** Neuron settings sections left open (by body index). */
+  private openNeurons = new Set<number>();
   private message = '';
   private previewTimer = 0;
   private root = document.getElementById('editor')!;
@@ -260,6 +280,34 @@ export class Editor {
       }
       left.appendChild(box);
     }
+    // Settings per neuron: bias, speed, internal inputs, being-eaten range.
+    const neurons = this.design.cells.map((c, i) => [c, i] as const).filter(([c]) => c.kind === 'neuron');
+    if (neurons.length) {
+      const box = el('div', { class: 'editor-settings' });
+      box.appendChild(el('div', { class: 'editor-label' }, 'Neurons'));
+      for (const [c, i] of neurons) {
+        const section = el('details', { class: 'neuron-settings' });
+        section.open = this.openNeurons.has(i);
+        section.addEventListener('toggle', () => (section.open ? this.openNeurons.add(i) : this.openNeurons.delete(i)));
+        section.appendChild(el('summary', {}, `Neuron ${i + 1}`));
+        section.appendChild(this.slider('Bias', neuronBias(c), -1, 1, 0.05, (v) => (c.bias = v)));
+        section.appendChild(this.slider('Speed', neuronSpeed(c), 0, 1, 0.05, (v) => (c.speed = v)));
+        section.appendChild(el('div', { class: 'editor-hint' }, 'Internal inputs (weight each, -1 to 1):'));
+        for (const key of NEURON_INPUT_KEYS) {
+          section.appendChild(
+            this.slider(INPUT_LABEL[key], c.inputs?.[key] ?? 0, -1, 1, 0.05, (v) => {
+              c.inputs = { ...(c.inputs ?? {}), [key]: v };
+            }),
+          );
+        }
+        section.appendChild(
+          this.slider('Eaten range', c.eatenRange ?? NEURON_INPUTS.eatenRangeMax, 1, NEURON_INPUTS.eatenRangeMax, 1, (v) => (c.eatenRange = v)),
+        );
+        section.appendChild(el('div', { class: 'editor-hint' }, `Being-eaten range in cells around the neuron; ${NEURON_INPUTS.eatenRangeMax} = the whole organism.`));
+        box.appendChild(section);
+      }
+      left.appendChild(box);
+    }
     // One type filter per Proximity sensor.
     const prox = this.design.cells.map((c, i) => [c, i] as const).filter(([c]) => c.kind === 'proximitySensor');
     if (prox.length) {
@@ -332,6 +380,8 @@ export class Editor {
     left.appendChild(choices);
     left.appendChild(el('div', { class: 'editor-hint' }, 'An organism reproduces once it reaches its max size and has enough stored energy and nutrient.'));
     const settings = el('div', { class: 'editor-settings' });
+    settings.appendChild(this.slider('Launch offspring', d.launch ?? 0, 0, 1, 0.05, (v) => (d.launch = v)));
+    settings.appendChild(el('div', { class: 'editor-hint' }, 'How hard a new bud or split-off piece is shot away from the parent. 0 = no launch.'));
     settings.appendChild(this.slider('Mutation rate', d.mutationRate ?? MUTATION.defaultRate, 0, 1, 0.05, (v) => (d.mutationRate = v)));
     settings.appendChild(
       el('div', { class: 'editor-hint' }, 'Scales every mutation chance for this design and its offspring. The middle is the normal rate; 0 means offspring are exact copies.'),
@@ -394,6 +444,11 @@ export class Editor {
               g.appendChild(t);
             }
           }
+          if (isSensor(c.kind)) {
+            // Sensors face outward from the cell they're attached to.
+            const attach = attachDirection(d.cells, idx);
+            if (attach >= 0) g.appendChild(this.facingArrow(cx, cy, (attach + 3) % 6, spacing));
+          }
           if (mode === 'body' && d.growth === 'form') {
             const t = svg('text', { x: cx, y: cy + 4, class: 'order' });
             t.textContent = String(idx + 1);
@@ -421,34 +476,53 @@ export class Editor {
       }
     }
     if (mode === 'wire') {
-      // Connections: lines from sensor to Jet, colored by sign, thicker for stronger weights.
+      // Connections: lines from source to target, colored by sign, thicker for
+      // stronger weights; dashed for a sensor's change output. A neuron wired to
+      // itself shows a loop; Pattern connections into the previous/next repeat are labeled.
       for (const w of d.wiring ?? []) {
-        const a = d.cells[w.sensor];
-        const b = d.cells[w.jet];
+        const a = d.cells[w.source];
+        const b = d.cells[w.target];
         if (!a || !b) continue;
         const [x1, y1] = hexPx(a.q, a.r, spacing);
         const [x2, y2] = hexPx(b.q, b.r, spacing);
-        root.appendChild(
-          svg('line', {
-            x1,
-            y1,
-            x2,
-            y2,
-            class: `wire ${w.weight >= 0 ? 'positive' : 'negative'}${w.output === 'change' ? ' change' : ''}`,
-            'stroke-width': 2 + Math.abs(w.weight) * 4,
-          }),
-        );
+        const cls = `wire ${w.weight >= 0 ? 'positive' : 'negative'}${w.output === 'change' && isSensor(a.kind) ? ' change' : ''}`;
+        const width = 2 + Math.abs(w.weight) * 4;
+        if (w.source === w.target) {
+          root.appendChild(svg('circle', { cx: x1 + HEX_SIZE * 0.55, cy: y1 - HEX_SIZE * 0.55, r: HEX_SIZE * 0.45, class: cls, fill: 'none', 'stroke-width': width }));
+        } else {
+          root.appendChild(svg('line', { x1, y1, x2, y2, class: cls, 'stroke-width': width }));
+        }
+        if (d.growth === 'pattern' && w.repeat && w.repeat !== 'same') {
+          const t = svg('text', { x: (x1 + x2) / 2, y: (y1 + y2) / 2 - 4, class: 'wire-repeat' });
+          t.textContent = w.repeat === 'previous' ? 'prev' : 'next';
+          root.appendChild(t);
+        }
       }
     }
     return root;
+  }
+
+  /** Arrow from a sensor's center the way it faces. */
+  private facingArrow(cx: number, cy: number, dir: number, spacing: number): SVGGElement {
+    const g = svg('g', { class: 'sensor-arrow' });
+    const [dx, dy] = hexPx(...HEX_DIRS[dir], spacing);
+    const len = Math.hypot(dx, dy);
+    const ux = dx / len;
+    const uy = dy / len;
+    const tip = [cx + ux * HEX_SIZE * 1.05, cy + uy * HEX_SIZE * 1.05];
+    const tail = [cx + ux * HEX_SIZE * 0.35, cy + uy * HEX_SIZE * 0.35];
+    const head = (side: number) => [tip[0] - ux * 6 - uy * 4 * side, tip[1] - uy * 6 + ux * 4 * side];
+    g.appendChild(svg('line', { x1: tail[0], y1: tail[1], x2: tip[0], y2: tip[1] }));
+    g.appendChild(svg('polyline', { points: `${head(1).join(',')} ${tip.join(',')} ${head(-1).join(',')}` }));
+    return g;
   }
 
   // ------------------------------------------------------------- behavior
 
   private renderBehaviorTab(left: HTMLElement): void {
     const d = this.design;
-    if (d.growth !== 'form') {
-      left.appendChild(el('div', { class: 'editor-hint' }, 'Behavior wiring only applies to Form designs for now. Choose Form on the Growth tab to wire sensors to Jets.'));
+    if (d.growth !== 'form' && d.growth !== 'pattern') {
+      left.appendChild(el('div', { class: 'editor-hint' }, 'Behavior wiring applies to Form and Pattern designs. Choose one on the Growth tab.'));
       return;
     }
     left.appendChild(
@@ -456,11 +530,35 @@ export class Editor {
         'div',
         { class: 'editor-hint' },
         this.pendingSensor === null
-          ? 'Click a sensor, then a Jet, to connect them. A Jet fires at its base strength plus the sum of weight × input, clamped to 0-1.'
-          : 'Now click a Jet to connect this sensor to it (click elsewhere to cancel).',
+          ? 'Click a sensor or neuron, then a Jet or neuron, to connect them. Click a neuron twice to wire it to itself. ' +
+              (d.growth === 'pattern' ? 'Wiring drawn in the motif is copied into every repeat.' : '')
+          : 'Now click a Jet or neuron to connect to (click empty space to cancel).',
       ),
     );
     left.appendChild(this.grid('wire'));
+
+    // Steering shortcuts per sensor.
+    const sensors = d.cells.map((c, i) => [c, i] as const).filter(([c]) => isSensor(c.kind));
+    if (sensors.length) {
+      const box = el('div', { class: 'editor-settings' });
+      box.appendChild(el('div', { class: 'editor-label' }, 'Steer'));
+      for (const [c, i] of sensors) {
+        const row = el('div', { class: 'wire-toggle steer-row' });
+        row.appendChild(el('span', { class: 'wire-name' }, `${KIND_LABEL[c.kind]} ${i + 1}`));
+        for (const [label, toward] of [
+          ['Steer toward', true],
+          ['Steer away', false],
+        ] as const) {
+          const b = el('button', {}, label);
+          b.title = `Wire this sensor to the Jets so the organism turns ${toward ? 'toward' : 'away from'} its side`;
+          b.addEventListener('click', () => this.steer(i, toward));
+          row.appendChild(b);
+        }
+        box.appendChild(row);
+      }
+      left.appendChild(box);
+    }
+
     const wiring = d.wiring ?? [];
     if (!wiring.length) return;
     const list = el('div', { class: 'editor-settings' });
@@ -468,17 +566,24 @@ export class Editor {
     wiring.forEach((w, k) => {
       const row = el('div', { class: 'wire-row' });
       const name = (i: number) => `${KIND_LABEL[d.cells[i].kind]} ${i + 1}`;
-      row.appendChild(el('span', { class: 'wire-name' }, `${name(w.sensor)} → ${name(w.jet)}`));
-      const slider = this.slider('Weight', w.weight, -1, 1, 0.05, (v) => (w.weight = v));
-      row.appendChild(slider);
+      row.appendChild(el('span', { class: 'wire-name' }, `${name(w.source)} → ${name(w.target)}`));
+      row.appendChild(this.slider('Weight', w.weight, -1, 1, 0.05, (v) => (w.weight = v)));
       const toggle = el('div', { class: 'wire-toggle' });
-      for (const out of ['level', 'change'] as const) {
-        const b = el('button', { class: w.output === out ? 'active' : '' }, out[0].toUpperCase() + out.slice(1));
-        b.addEventListener('click', () => {
-          w.output = out;
-          this.render();
-        });
-        toggle.appendChild(b);
+      const choose = <T extends string>(options: readonly T[], current: T, set: (v: T) => void) => {
+        for (const opt of options) {
+          const b = el('button', { class: current === opt ? 'active' : '' }, opt[0].toUpperCase() + opt.slice(1));
+          b.addEventListener('click', () => {
+            set(opt);
+            this.render();
+          });
+          toggle.appendChild(b);
+        }
+      };
+      // Sensors have two outputs; neurons have one.
+      if (isSensor(d.cells[w.source].kind)) choose(['level', 'change'] as const, w.output, (v) => (w.output = v));
+      if (d.growth === 'pattern') {
+        toggle.appendChild(el('span', { class: 'wire-sep' }, 'target in'));
+        choose(['same', 'previous', 'next'] as const, w.repeat ?? 'same', (v) => (w.repeat = v));
       }
       const remove = el('button', { 'aria-label': 'Remove connection' }, '×');
       remove.addEventListener('click', () => {
@@ -496,19 +601,74 @@ export class Editor {
     const d = this.design;
     const idx = d.cells.findIndex((c) => c.q === q && c.r === r);
     const kind = idx >= 0 ? d.cells[idx].kind : null;
-    if (kind && isSensor(kind)) {
-      this.pendingSensor = idx;
-    } else if (kind === 'jet' && this.pendingSensor !== null) {
+    const pending = this.pendingSensor;
+    if (pending !== null && kind && isTarget(kind)) {
+      // Connect (a neuron clicked twice gets a self-connection).
       d.wiring = d.wiring ?? [];
-      if (!d.wiring.some((w) => w.sensor === this.pendingSensor && w.jet === idx)) {
-        d.wiring.push({ sensor: this.pendingSensor, jet: idx, weight: 0.5, output: 'level' });
-      }
+      if (!d.wiring.some((w) => w.source === pending && w.target === idx)) d.wiring.push({ source: pending, target: idx, weight: 0.5, output: 'level' });
       this.pendingSensor = null;
+    } else if (kind && isSource(kind)) {
+      this.pendingSensor = idx;
     } else if (kind === 'jet') {
-      return this.flash('Click a sensor first, then the Jet.');
+      return this.flash('Click a sensor or neuron first, then the Jet.');
     } else {
       this.pendingSensor = null;
     }
+    this.render();
+  }
+
+  /**
+   * Steer toward / away: wires a sensor's level to the Jets so the organism
+   * turns toward (or away from) the side the sensor is on. The heading is the
+   * Jets' net push; a Jet whose push turns the body that way gets +weight, one
+   * that turns it the other way gets -weight. Replaces this sensor's existing
+   * Jet connections; the result is ordinary wiring.
+   */
+  private steer(sensor: number, toward: boolean): void {
+    const d = this.design;
+    const pos = (i: number) => hexToLocal(d.cells[i].q, d.cells[i].r);
+    const jets = d.cells.map((c, i) => [c, i] as const).filter(([c, i]) => c.kind === 'jet' && !jetBlocked(d.cells, i) && attachDirection(d.cells, i) >= 0);
+    if (!jets.length) return this.flash('Add Jets that can push (not blocked) first.');
+    let cx = 0;
+    let cy = 0;
+    d.cells.forEach((_, i) => {
+      const [x, y] = pos(i);
+      cx += x / d.cells.length;
+      cy += y / d.cells.length;
+    });
+    const pushOf = (i: number) => hexToLocal(...HEX_DIRS[attachDirection(d.cells, i)]);
+    let hx = 0;
+    let hy = 0;
+    for (const [, i] of jets) {
+      const [ux, uy] = pushOf(i);
+      hx += ux;
+      hy += uy;
+    }
+    if (Math.hypot(hx, hy) < 1e-6) [hx, hy] = [1, 0];
+    const [sx, sy] = pos(sensor);
+    let side = hx * (sy - cy) - hy * (sx - cx);
+    if (Math.abs(side) < 1e-6) {
+      // Sensor on the body's axis: use the way it faces instead.
+      const attach = attachDirection(d.cells, sensor);
+      if (attach >= 0) {
+        const [fx, fy] = hexToLocal(...HEX_DIRS[(attach + 3) % 6]);
+        side = hx * fy - hy * fx;
+      }
+    }
+    if (Math.abs(side) < 1e-6) return this.flash('This sensor is straight ahead or behind, so there is no side to steer toward.');
+    const turn = Math.sign(side) * (toward ? 1 : -1);
+    d.wiring = (d.wiring ?? []).filter((w) => !(w.source === sensor && d.cells[w.target].kind === 'jet'));
+    let added = 0;
+    for (const [, i] of jets) {
+      const [px, py] = pos(i);
+      const [ux, uy] = pushOf(i);
+      const torque = (px - cx) * uy - (py - cy) * ux;
+      if (Math.abs(torque) < 1e-6) continue;
+      const wire: Wire = { source: sensor, target: i, weight: DESIGN.steerWeight * Math.sign(torque) * turn, output: 'level' };
+      d.wiring.push(wire);
+      added++;
+    }
+    this.message = added ? `Wired ${added} Jet connection${added === 1 ? '' : 's'} to steer ${toward ? 'toward' : 'away from'} this sensor's side.` : 'No Jet can turn the body.';
     this.render();
   }
 
@@ -540,8 +700,8 @@ export class Editor {
       trial.pattern.ends = trial.pattern.ends.filter((e) => e !== idx).map(shift);
       trial.pattern.start = trial.pattern.start === idx ? 0 : shift(trial.pattern.start);
       trial.wiring = (trial.wiring ?? [])
-        .filter((w) => w.sensor !== idx && w.jet !== idx)
-        .map((w) => ({ ...w, sensor: shift(w.sensor), jet: shift(w.jet) }));
+        .filter((w) => w.source !== idx && w.target !== idx)
+        .map((w) => ({ ...w, source: shift(w.source), target: shift(w.target) }));
       if (trial.cells.length && trial.cells.some((c, i) => i > 0 && !trial.cells.slice(0, i).some((p) => areNeighbors(p.q, p.r, c.q, c.r)))) {
         this.message = '';
         this.flash('Removing that cell would leave a later cell unconnected.');
@@ -557,8 +717,9 @@ export class Editor {
       d.cells[idx].kind = kind;
       d.cells[idx].strength = kind === 'jet' ? (d.cells[idx].strength ?? JET.defaultStrength) : undefined;
       if (kind !== 'proximitySensor') delete d.cells[idx].filter;
-      // Drop connections that no longer join a sensor to a Jet.
-      d.wiring = (d.wiring ?? []).filter((w) => isSensor(d.cells[w.sensor].kind) && d.cells[w.jet].kind === 'jet');
+      // Drop connections that no longer run from a source to a target.
+      d.wiring = (d.wiring ?? []).filter((w) => isSource(d.cells[w.source].kind) && isTarget(d.cells[w.target].kind));
+      if (kind !== 'neuron') for (const key of ['bias', 'speed', 'inputs', 'eatenRange'] as const) delete d.cells[idx][key];
     } else {
       if (d.cells.length >= DESIGN.maxCells) return this.flash(`A body can have at most ${DESIGN.maxCells} cells.`);
       if (d.cells.length && !d.cells.some((c) => areNeighbors(c.q, c.r, q, r))) return this.flash('New cells must touch the body.');
@@ -667,7 +828,9 @@ export class Editor {
     const box = el('div', { class: 'editor-stats' });
     if (validateDesign(this.design)) return box;
     const s = designStats(this.design);
-    const perTick = (m: number) => ((s.cells * METABOLISM.upkeep * m) / SIM.tickHz).toFixed(2);
+    // Decomposers pay a reduced upkeep.
+    const upkeepCells = s.cells - s.kinds.decomposer * (1 - METABOLISM.decomposerUpkeep);
+    const perTick = (m: number) => ((upkeepCells * METABOLISM.upkeep * m) / SIM.tickHz).toFixed(2);
     const rows: [string, string][] = [
       [
         'Cells',

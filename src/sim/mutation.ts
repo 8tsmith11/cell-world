@@ -6,8 +6,12 @@ import {
   type Design,
   HEX_DIRS,
   hexDistance,
-  isSensor,
+  isSource,
+  isTarget,
   jetStrength,
+  neuronBias,
+  neuronSpeed,
+  normalizeDesign,
   bodyMix,
   validateDesign,
 } from './genome';
@@ -20,7 +24,7 @@ const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v
  * mutation is tried on its own and kept only if the design stays valid.
  */
 export function mutate(parent: Design, rng: () => number): { design: Design; count: number } {
-  let design: Design = structuredClone(parent);
+  let design: Design = normalizeDesign(structuredClone(parent));
   const scale = (design.mutationRate ?? MUTATION.defaultRate) / MUTATION.defaultRate;
   const small = MUTATION.small * scale;
   const rare = MUTATION.rare * scale;
@@ -44,6 +48,11 @@ export function mutate(parent: Design, rng: () => number): { design: Design; cou
   }
   design.cells.forEach((c, i) => {
     if (c.kind === 'jet' && rng() < small) attempt((d) => ((d.cells[i].strength = clamp(jetStrength(d.cells[i]) + nudge(MUTATION.strengthNudge), 0, 1)), true));
+  });
+  design.cells.forEach((c, i) => {
+    if (c.kind !== 'neuron') return;
+    if (rng() < small) attempt((d) => ((d.cells[i].bias = clamp(neuronBias(d.cells[i]) + nudge(MUTATION.biasNudge), -1, 1)), true));
+    if (rng() < small) attempt((d) => ((d.cells[i].speed = clamp(neuronSpeed(d.cells[i]) + nudge(MUTATION.speedNudge), 0, 1)), true));
   });
   if (rng() < small) attempt((d) => ((d.growEnergy = Math.round(clamp(d.growEnergy + nudge(MUTATION.energyNudge), DESIGN.growEnergyMin, DESIGN.growEnergyMax))), true));
   if (rng() < small) attempt((d) => ((d.growNutrient = Math.round(clamp(d.growNutrient + nudge(MUTATION.nutrientNudge), CELL.bodyNutrient, DESIGN.growNutrientMax))), true));
@@ -85,7 +94,7 @@ export function mutate(parent: Design, rng: () => number): { design: Design; cou
       const kind = pick(CELL_KINDS.filter((k) => k !== d.cells[i].kind));
       // A changed cell keeps only the settings that fit its new type.
       d.cells[i] = { q: d.cells[i].q, r: d.cells[i].r, kind, ...(kind === 'jet' ? { strength: jetStrength(d.cells[i]) } : {}) };
-      d.wiring = (d.wiring ?? []).filter((w) => isSensor(d.cells[w.sensor].kind) && d.cells[w.jet].kind === 'jet');
+      d.wiring = (d.wiring ?? []).filter((w) => isSource(d.cells[w.source].kind) && isTarget(d.cells[w.target].kind));
       return true;
     });
   }
@@ -110,7 +119,7 @@ export function mutate(parent: Design, rng: () => number): { design: Design; cou
       const idx = Math.floor(rng() * d.cells.length);
       d.cells.splice(idx, 1);
       const shift = (i: number) => (i > idx ? i - 1 : i);
-      d.wiring = (d.wiring ?? []).filter((w) => w.sensor !== idx && w.jet !== idx).map((w) => ({ ...w, sensor: shift(w.sensor), jet: shift(w.jet) }));
+      d.wiring = (d.wiring ?? []).filter((w) => w.source !== idx && w.target !== idx).map((w) => ({ ...w, source: shift(w.source), target: shift(w.target) }));
       if (d.pattern.start === idx) return false;
       d.pattern.start = shift(d.pattern.start);
       d.pattern.ends = d.pattern.ends.filter((e) => e !== idx).map(shift);
@@ -118,7 +127,7 @@ export function mutate(parent: Design, rng: () => number): { design: Design; cou
       return true;
     });
   }
-  // Add or remove a wiring connection.
+  // Add or remove a wiring connection (any source: sensor or neuron; any target: Jet or neuron).
   if (rng() < rare) {
     attempt((d) => {
       d.wiring = d.wiring ?? [];
@@ -126,13 +135,14 @@ export function mutate(parent: Design, rng: () => number): { design: Design; cou
         d.wiring.splice(Math.floor(rng() * d.wiring.length), 1);
         return true;
       }
-      const sensors = d.cells.map((c, i) => [c, i] as const).filter(([c]) => isSensor(c.kind));
-      const jets = d.cells.map((c, i) => [c, i] as const).filter(([c]) => c.kind === 'jet');
-      if (!sensors.length || !jets.length) return false;
-      const sensor = pick(sensors)[1];
-      const jet = pick(jets)[1];
-      if (d.wiring.some((w) => w.sensor === sensor && w.jet === jet)) return false;
-      d.wiring.push({ sensor, jet, weight: Math.round(nudge(1) * 20) / 20, output: rng() < 0.5 ? 'level' : 'change' });
+      const sources = d.cells.map((c, i) => [c, i] as const).filter(([c]) => isSource(c.kind));
+      const targets = d.cells.map((c, i) => [c, i] as const).filter(([c]) => isTarget(c.kind));
+      if (!sources.length || !targets.length) return false;
+      const source = pick(sources)[1];
+      const target = pick(targets)[1];
+      if (d.wiring.some((w) => w.source === source && w.target === target)) return false;
+      const repeat = d.growth === 'pattern' ? pick(['same', 'previous', 'next'] as const) : undefined;
+      d.wiring.push({ source, target, weight: Math.round(nudge(1) * 20) / 20, output: rng() < 0.5 ? 'level' : 'change', ...(repeat ? { repeat } : {}) });
       return true;
     });
   }

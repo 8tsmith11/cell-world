@@ -89,8 +89,13 @@ export function decodeNutrient(buf: ArrayBuffer): Uint32Array {
 // Energy is sent as a fraction of the cell type's cap.
 // x/y are quantized over the world size, angle to 256 steps, energy to 255.
 
+// Then u32 wire count and, per wire among the listed cells (5 bytes):
+// u16 source id, u16 target id, i8 weight × 127.
+// Each cell record also carries i8 signal: a neuron's output × 127 (0 for other cells).
+
 const POS_HEADER = 12;
-const POS_RECORD = 10;
+const POS_RECORD = 11;
+const WIRE_RECORD = 5;
 
 export interface PositionRecord {
   id: number;
@@ -102,10 +107,19 @@ export interface PositionRecord {
   nutrient: number;
   drained: number;
   firing: number;
+  /** Neuron output, -1 to 1. */
+  signal: number;
 }
 
 export function encodePositions(time: number, frame: FrameMsg, ids: number[]): ArrayBuffer {
-  const buf = new ArrayBuffer(POS_HEADER + ids.length * POS_RECORD);
+  // Wires whose both ends are in this update.
+  const listed = new Set(ids);
+  const wires: number[] = [];
+  for (let k = 0; k < frame.wires.length; k += 3) {
+    if (listed.has(frame.wires[k]) && listed.has(frame.wires[k + 1])) wires.push(frame.wires[k], frame.wires[k + 1], frame.wires[k + 2]);
+  }
+  const wireAt = POS_HEADER + ids.length * POS_RECORD;
+  const buf = new ArrayBuffer(wireAt + 4 + (wires.length / 3) * WIRE_RECORD);
   const v = new DataView(buf);
   v.setUint32(0, Tag.Positions, true);
   v.setFloat32(4, time, true);
@@ -123,18 +137,28 @@ export function encodePositions(time: number, frame: FrameMsg, ids: number[]): A
     v.setUint8(o + 7, Math.round(Math.min(1, Math.max(0, frame.cellEnergy[i] / energyCap(frame.cellType[i]))) * 255));
     v.setUint8(o + 8, Math.min(255, frame.cellNutrient[i]));
     v.setUint8(o + 9, (frame.cellDrained[i] ? 1 : 0) | (frame.cellFiring[i] ? 2 : 0));
+    v.setInt8(o + 10, Math.round(Math.max(-1, Math.min(1, frame.cellSignal[i])) * 127));
     o += POS_RECORD;
+  }
+  v.setUint32(wireAt, wires.length / 3, true);
+  o = wireAt + 4;
+  for (let k = 0; k < wires.length; k += 3) {
+    v.setUint16(o, wires[k], true);
+    v.setUint16(o + 2, wires[k + 1], true);
+    v.setInt8(o + 4, Math.round(wires[k + 2] * 127));
+    o += WIRE_RECORD;
   }
   return buf;
 }
 
-export function decodePositions(buf: ArrayBuffer, each: (r: PositionRecord) => void): number {
+/** Calls `each` per cell; returns the time of day and the wires among the listed cells ([source, target, weight]*). */
+export function decodePositions(buf: ArrayBuffer, each: (r: PositionRecord) => void): { time: number; wires: Float32Array } {
   const v = new DataView(buf);
   const count = v.getUint32(8, true);
   const qx = WORLD_W() / 65535;
   const qy = WORLD_H() / 65535;
   const qa = (Math.PI * 2) / 256;
-  const r: PositionRecord = { id: 0, x: 0, y: 0, angle: 0, energyFraction: 0, nutrient: 0, drained: 0, firing: 0 };
+  const r: PositionRecord = { id: 0, x: 0, y: 0, angle: 0, energyFraction: 0, nutrient: 0, drained: 0, firing: 0, signal: 0 };
   let o = POS_HEADER;
   for (let k = 0; k < count; k++) {
     r.id = v.getUint16(o, true);
@@ -145,8 +169,18 @@ export function decodePositions(buf: ArrayBuffer, each: (r: PositionRecord) => v
     r.nutrient = v.getUint8(o + 8);
     r.drained = v.getUint8(o + 9) & 1;
     r.firing = (v.getUint8(o + 9) >> 1) & 1;
+    r.signal = v.getInt8(o + 10) / 127;
     each(r);
     o += POS_RECORD;
   }
-  return v.getFloat32(4, true);
+  const wireCount = v.getUint32(o, true);
+  o += 4;
+  const wires = new Float32Array(wireCount * 3);
+  for (let k = 0; k < wireCount; k++) {
+    wires[k * 3] = v.getUint16(o, true);
+    wires[k * 3 + 1] = v.getUint16(o + 2, true);
+    wires[k * 3 + 2] = v.getInt8(o + 4) / 127;
+    o += WIRE_RECORD;
+  }
+  return { time: v.getFloat32(4, true), wires };
 }

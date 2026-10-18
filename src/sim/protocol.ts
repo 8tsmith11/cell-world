@@ -54,6 +54,10 @@ export interface CellInfo {
   storedNutrient: number;
   age: number;
   organism: number;
+  /** Sensors: level and change. Neurons: output. */
+  sensorLevel: number;
+  sensorChange: number;
+  neuronOutput: number;
   org: OrganismInfo | null;
 }
 
@@ -77,6 +81,10 @@ export interface FrameMsg {
   cellDrained: Uint8Array;
   /** 1 if a Jet fired this tick. */
   cellFiring: Uint8Array;
+  /** Neuron outputs (-1 to 1; 0 for other cells). */
+  cellSignal: Float32Array;
+  /** Living wires: [source cell, target cell, weight]*. */
+  wires: Float32Array;
   cellOrganism: Int32Array;
   /** Lineage and owner of each cell (Dead cells keep theirs). */
   cellLineage: Int32Array;

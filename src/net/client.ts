@@ -20,6 +20,9 @@ class ReplicatedCells implements RenderCells {
   readonly cellDrained = new Uint8Array(SIM.maxCells);
   readonly cellFiring = new Uint8Array(SIM.maxCells);
   readonly cellOwner = new Int32Array(SIM.maxCells);
+  readonly cellSignal = new Float32Array(SIM.maxCells);
+  /** Wires among the cells in the latest position update. */
+  wires = new Float32Array(0);
   readonly organism = new Int32Array(SIM.maxCells);
   private fromX = new Float32Array(SIM.maxCells);
   private fromY = new Float32Array(SIM.maxCells);
@@ -204,7 +207,7 @@ export class ClientSession implements GameSource {
       for (let k = 0; k < pairs.length; k += 2) this.world.nutrient[pairs[k]] = pairs[k + 1];
     } else if (tag === Tag.Positions) {
       const cells = this.replicated;
-      this.worldTime = decodePositions(buf, (r) => {
+      const update = decodePositions(buf, (r) => {
         if (cells.cellType[r.id] === CellType.None) return;
         cells.moveTo(r.id, r.x, r.y, now);
         cells.cellAngle[r.id] = r.angle;
@@ -212,7 +215,10 @@ export class ClientSession implements GameSource {
         cells.cellNutrient[r.id] = r.nutrient;
         cells.cellDrained[r.id] = r.drained;
         cells.cellFiring[r.id] = r.firing;
+        cells.cellSignal[r.id] = r.signal;
       });
+      this.worldTime = update.time;
+      cells.wires = update.wires;
     }
   }
 
