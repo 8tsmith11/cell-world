@@ -164,7 +164,7 @@ export class Water {
           uDepthMax: f32(DEPTH.max),
           uLightK: f32(LIGHT.attenuation),
           uTempCenter: f32(TEMPERATURE.center),
-          uTempEdge: f32(TEMPERATURE.edge),
+          uTempEdge: f32(TEMPERATURE.edge - TEMPERATURE.depthCooling),
           uOverlay: f32(0),
           uShallowPower: f32(WATER.shallowPower),
           uNightFloor: f32(WATER.nightFloor),
@@ -194,9 +194,11 @@ export class Water {
   }
 
   setWorld(depth: Float32Array, temperature: Float32Array): void {
-    const tempRange = TEMPERATURE.center - TEMPERATURE.edge;
+    // The coldest water is the deep edge: TEMPERATURE.edge minus the depth cooling.
+    const coldest = TEMPERATURE.edge - TEMPERATURE.depthCooling;
+    const tempRange = TEMPERATURE.center - coldest;
     for (let i = 0; i < depth.length; i++) {
-      this.field[i * 4 + 1] = Math.round(((temperature[i] - TEMPERATURE.edge) / tempRange) * 255);
+      this.field[i * 4 + 1] = Math.round(Math.min(1, Math.max(0, (temperature[i] - coldest) / tempRange)) * 255);
       // Depth is split across two bytes (r = high, a = low) for 16-bit precision.
       const d = Math.min(1, Math.max(0, (depth[i] - DEPTH.min) / (DEPTH.max - DEPTH.min))) * 255;
       const hi = Math.floor(d);

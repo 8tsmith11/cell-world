@@ -37,6 +37,8 @@ export class HostSession implements GameSource {
   private pending = new Set<number>();
   /** Water nutrient as of the last diff sent; diffs carry absolute values. */
   private lastSentWater: Uint32Array | null = null;
+  /** Latest water nutrient from the worker (it arrives every few frames). */
+  private latestWater: Uint32Array | null = null;
   private isPaused = false;
   private noticeText = '';
   private noticeUntil = 0;
@@ -150,6 +152,7 @@ export class HostSession implements GameSource {
       this.worldVersion++;
       this.frame = null;
       this.lastSentWater = null;
+      this.latestWater = null;
       // A new world starts with no lineages.
       this.lineageStats.clear();
       this.announced = CATEGORIES.map(() => null);
@@ -158,8 +161,9 @@ export class HostSession implements GameSource {
       for (const p of this.players) if (p.id !== 0) this.pending.add(p.id);
     } else if (msg.type === 'frame') {
       this.frame = msg;
+      if (msg.waterNutrient) this.latestWater = msg.waterNutrient;
       this.isPaused = msg.paused;
-      if (this.pending.size > 0) this.sendSnapshots(msg);
+      if (this.pending.size > 0 && this.latestWater) this.sendSnapshots(msg);
       if (msg.events.length > 0) this.conn.sendBinaryTo(null, encodeEvents(msg.events));
     } else if (msg.type === 'released') {
       this.onReleased(msg);
@@ -299,7 +303,8 @@ export class HostSession implements GameSource {
     // so diffs after the snapshot stay consistent for old and new clients alike.
     this.sendNutrientDiff();
     const start = { t: 'start' as const, seed: this.world!.seed, config: exportConfig(), debug: this.debug, players: this.players };
-    const snapshot = encodeSnapshot(frame);
+    // New clients start from the same water baseline the others hold.
+    const snapshot = encodeSnapshot({ ...frame, waterNutrient: (this.lastSentWater ?? this.latestWater)! });
     for (const id of this.pending) {
       this.conn.sendTo(id, start);
       this.conn.sendBinaryTo(id, snapshot);
@@ -310,19 +315,34 @@ export class HostSession implements GameSource {
     this.pending.clear();
   }
 
+  /**
+   * Sends water tiles that changed noticeably since they were last sent: by at
+   * least NETWORK.nutrientDiffMin, or reaching or leaving zero. Currents move
+   * nutrient everywhere, so tiny changes are left out to save bandwidth.
+   */
   private sendNutrientDiff(): void {
-    if (!this.frame) return;
-    const water = this.frame.waterNutrient;
-    if (!this.lastSentWater) {
+    const water = this.latestWater;
+    if (!water) return;
+    const sent = this.lastSentWater;
+    if (!sent) {
       this.lastSentWater = water.slice();
       return;
     }
     const pairs: number[] = [];
     for (let i = 0; i < water.length; i++) {
-      if (water[i] !== this.lastSentWater[i]) pairs.push(i, water[i]);
+      const v = water[i];
+      const old = sent[i];
+      if (v === old) continue;
+      if (Math.abs(v - old) >= NETWORK.nutrientDiffMin || v === 0 || old === 0) {
+        pairs.push(i, v);
+        sent[i] = v;
+      }
     }
-    this.lastSentWater.set(water);
     if (pairs.length > 0) this.conn.sendBinaryTo(null, encodeNutrient(pairs));
+  }
+
+  stepMs(): number | null {
+    return this.frame?.stepMs ?? null;
   }
 
   /** Each client gets positions only for cells in or near its camera view, plus the time of day. */
@@ -377,7 +397,7 @@ export class HostSession implements GameSource {
   }
 
   water(): Uint32Array | null {
-    return this.frame?.waterNutrient ?? null;
+    return this.latestWater;
   }
 
   time(): number {

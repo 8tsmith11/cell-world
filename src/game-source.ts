@@ -8,6 +8,10 @@ export interface StaticWorld {
   temperature: Float32Array;
   currentDir: Float32Array;
   currentStrength: Float32Array;
+  currentVx: Float32Array;
+  currentVy: Float32Array;
+  /** Hydrothermal vent strength per tile (0 to 1). */
+  chem: Float32Array;
 }
 
 /** Cell state for drawing, one entry per cell slot (type 0 = empty slot). */
@@ -91,6 +95,8 @@ export interface GameSource {
   hoverInfo(): CellInfo | null;
   setHover(id: number): void;
   setView(view: ViewRect): void;
+  /** Host only: average simulation time per tick in ms (null elsewhere). */
+  stepMs(): number | null;
   /** Nutrient totals (debug mode only). */
   stats(): { water: number; cells: number } | null;
   /** Host debug tools; no-ops elsewhere. */

@@ -1,4 +1,4 @@
-import { CELL, CELL_STYLE, DESIGN, JET, METABOLISM, MUTATION, NEURON_INPUTS, SIM } from '../config';
+import { CELL, CELL_STYLE, DESIGN, JET, METABOLISM, MUTATION, NEURON_INPUTS, SIM, TIMER, TIP } from '../config';
 import {
   ALLOWED_REPRODUCTION,
   areNeighbors,
@@ -26,12 +26,21 @@ import {
   type ReproductionType,
   singleCellDesign,
   validateDesign,
+  freshCell,
+  type ProximityFilter,
+  TIP_CHANNELS,
+  timerCycles,
+  timerDuty,
+  timerPhase,
+  tipDeposit,
+  tipGrow,
 } from '../sim/genome';
+import { timerLevel } from '../sim/sim';
 import { createRng } from '../sim/rng';
 import { loadDesigns, storeDesigns } from './designs';
 
 type Tab = 'body' | 'growth' | 'reproduction' | 'behavior';
-type Tool = CellKind | 'erase' | 'start' | 'end';
+type Tool = CellKind | 'erase' | 'start' | 'end' | 'head' | 'tail';
 
 const SVG = 'http://www.w3.org/2000/svg';
 const HEX_SIZE = 22; // editor hex radius in px
@@ -51,6 +60,22 @@ const KIND_LABEL: Record<CellKind, string> = {
   touchSensor: 'Touch sensor',
   proximitySensor: 'Proximity sensor',
   neuron: 'Neuron',
+  chemosynth: 'Chemosynth',
+  filter: 'Filter',
+  shell: 'Shell',
+  tip: 'Growth tip',
+  timer: 'Timer',
+};
+/** What each cell does, shown as a tooltip on its palette button. */
+const KIND_INFO: Partial<Record<CellKind, string>> = {
+  chemosynth: 'Gains energy from hydrothermal vents in deep water, day and night.',
+  filter: 'Feeds on water flowing through it: energy and nutrient from the current. Best on anchored or swimming bodies.',
+  shell: 'Armor: very low upkeep, and Mouths drain it slowly.',
+  tip: 'Growth tip: grows the spot it faces and moves onto it, leaving cells behind. Wire its Grow, Turn and Branch signals.',
+  timer: 'A clock: on for part of each cycle, following the time of day. Wire it like a sensor.',
+  spike: 'Defensive: a Mouth that bites a Spike loses more energy than it gains.',
+  fat: 'Stores lots of energy and nutrient for the body.',
+  root: 'Anchors the organism and absorbs nutrient from a wide area.',
 };
 const INPUT_LABEL: Record<NeuronInput, string> = {
   forward: 'Forward speed',
@@ -70,6 +95,7 @@ const GROWTH_INFO: Record<GrowthType, string> = {
   blob: 'Grows the body, then adds cells at random free spots on its edge, up to max cells. New cells follow the mix of cell types in the body.',
   pattern:
     'Repeats the body as a motif. Each repeat attaches its start cell to an end point of the previous one, continuing from start to end. One end point makes a chain; several make it branch.',
+  worm: 'Keeps a head and a tail, and grows by adding copies of the middle segment between them, up to max segments.',
 };
 const REPRO_INFO: Record<ReproductionType, string> = {
   split: 'Divides into two halves.',
@@ -217,7 +243,7 @@ export class Editor {
       const b = el('button', { class: t === this.tab ? 'active' : '' }, t[0].toUpperCase() + t.slice(1));
       b.addEventListener('click', () => {
         this.tab = t;
-        this.tool = t === 'growth' && this.design.growth === 'pattern' ? 'start' : t === 'body' ? 'leaf' : this.tool;
+        this.tool = t === 'growth' && (this.design.growth === 'pattern' || this.design.growth === 'worm') ? 'start' : t === 'body' ? 'leaf' : this.tool;
         this.render();
       });
       tabs.appendChild(b);
@@ -254,6 +280,8 @@ export class Editor {
       if ((CELL_KINDS as readonly string[]).includes(t)) {
         const color = KIND_COLOR[t as CellKind];
         b.prepend(el('span', { class: 'swatch', style: `background:${color};color:${color}` }));
+        const info = KIND_INFO[t as CellKind];
+        if (info) b.title = info;
       }
       b.addEventListener('click', () => {
         this.tool = t;
@@ -316,11 +344,12 @@ export class Editor {
       for (const [c, i] of prox) {
         const row = el('label', { class: 'editor-slider' });
         const select = el('select', { 'aria-label': `Proximity sensor ${i + 1} filter` });
-        select.appendChild(el('option', { value: '' }, 'Any cell'));
+        select.appendChild(el('option', { value: '' }, 'Any living cell'));
+        select.appendChild(el('option', { value: 'dead' }, 'Dead cells'));
         for (const k of CELL_KINDS) select.appendChild(el('option', { value: k }, `${KIND_LABEL[k]} cells`));
         select.value = c.filter ?? '';
         select.addEventListener('change', () => {
-          c.filter = (select.value || undefined) as CellKind | undefined;
+          c.filter = (select.value || undefined) as ProximityFilter | undefined;
           if (!c.filter) delete c.filter;
           this.render();
         });
@@ -329,19 +358,109 @@ export class Editor {
       }
       left.appendChild(box);
     }
+    this.renderTipSettings(left);
+    this.renderTimerSettings(left);
     const hint =
       this.design.growth === 'form'
         ? 'The first cell is the starter. Numbers show the growth order. Each new cell must touch one placed before it.'
         : this.design.growth === 'pattern'
           ? 'The body is the motif. Mark its start cell and end points on the Growth tab.'
+          : this.design.growth === 'worm'
+            ? 'Draw the head, one segment and the tail. Mark them on the Growth tab.'
           : 'The first cell is the starter. Blob grows this body first, then adds cells from the cell mix.';
     left.appendChild(el('div', { class: 'editor-hint' }, hint));
+  }
+
+  /** Growth tips: the cell types each leaves behind (a repeating list) and its base Grow, Turn and Branch signals. */
+  private renderTipSettings(left: HTMLElement): void {
+    const tips = this.design.cells.map((c, i) => [c, i] as const).filter(([c]) => c.kind === 'tip');
+    if (!tips.length) return;
+    const box = el('div', { class: 'editor-settings' });
+    box.appendChild(el('div', { class: 'editor-label' }, 'Growth tips'));
+    for (const [c, i] of tips) {
+      const section = el('details', { class: 'neuron-settings' });
+      section.open = this.openNeurons.has(i);
+      section.addEventListener('toggle', () => (section.open ? this.openNeurons.add(i) : this.openNeurons.delete(i)));
+      section.appendChild(el('summary', {}, `Growth tip ${i + 1}`));
+      section.appendChild(el('div', { class: 'editor-hint' }, 'Leaves behind, in a repeating cycle (click a chip to change it):'));
+      const chips = el('div', { class: 'wire-toggle' });
+      const deposit = tipDeposit(c);
+      deposit.forEach((k, n) => {
+        const chip = el('button', {}, KIND_LABEL[k]);
+        chip.prepend(el('span', { class: 'swatch', style: `background:${KIND_COLOR[k]};color:${KIND_COLOR[k]}` }));
+        chip.title = 'Click to change the type; right-click to remove';
+        chip.addEventListener('click', () => {
+          const next = CELL_KINDS[(CELL_KINDS.indexOf(k) + 1) % CELL_KINDS.length];
+          c.deposit = deposit.map((d, m) => (m === n ? next : d));
+          this.render();
+        });
+        chip.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          if (deposit.length > 1) c.deposit = deposit.filter((_, m) => m !== n);
+          this.render();
+        });
+        chips.appendChild(chip);
+      });
+      if (deposit.length < TIP.maxDeposit) {
+        const add = el('button', { 'aria-label': 'Add a cell type to the cycle' }, '+');
+        add.addEventListener('click', () => {
+          c.deposit = [...deposit, 'leaf'];
+          this.render();
+        });
+        chips.appendChild(add);
+      }
+      section.appendChild(chips);
+      section.appendChild(this.slider('Grow', tipGrow(c), -1, 1, 0.05, (v) => (c.grow = v)));
+      section.appendChild(this.slider('Turn', c.turn ?? 0, -1, 1, 0.05, (v) => (c.turn = v)));
+      section.appendChild(this.slider('Branch', c.branch ?? 0, -1, 1, 0.05, (v) => (c.branch = v)));
+      section.appendChild(
+        el(
+          'div',
+          { class: 'editor-hint' },
+          `Grows while Grow is above ${TIP.growThreshold}. Turn above ${TIP.turnThreshold} turns right, below -${TIP.turnThreshold} left. ` +
+            `Branch above ${TIP.branchThreshold} starts a side tip. Wire sensors, neurons or timers into these on the Behavior tab. ` +
+            'In Blob designs tips steer all growth; in others they choose which planned spot grows next.',
+        ),
+      );
+      box.appendChild(section);
+    }
+    left.appendChild(box);
+  }
+
+  /** Timers: cycles per day, when they switch on, how long they stay on, and a 24-hour strip of their output. */
+  private renderTimerSettings(left: HTMLElement): void {
+    const timers = this.design.cells.map((c, i) => [c, i] as const).filter(([c]) => c.kind === 'timer');
+    if (!timers.length) return;
+    const box = el('div', { class: 'editor-settings' });
+    box.appendChild(el('div', { class: 'editor-label' }, 'Timers'));
+    for (const [c, i] of timers) {
+      const section = el('details', { class: 'neuron-settings' });
+      section.open = this.openNeurons.has(i);
+      section.addEventListener('toggle', () => (section.open ? this.openNeurons.add(i) : this.openNeurons.delete(i)));
+      section.appendChild(el('summary', {}, `Timer ${i + 1}`));
+      section.appendChild(this.slider('Cycles per day', timerCycles(c), 1, TIMER.maxCycles, 1, (v) => (c.cycles = v)));
+      section.appendChild(this.slider('Switch on at', timerPhase(c), 0, 0.99, 0.01, (v) => (c.phase = v)));
+      section.appendChild(this.slider('On for', timerDuty(c), 0.02, 0.98, 0.01, (v) => (c.duty = v)));
+      // 24-hour strip: midnight at the ends, noon in the middle; bright where the timer is on.
+      const strip = svg('svg', { class: 'timer-strip', viewBox: '0 0 96 12', width: '100%', height: '14' });
+      for (let k = 0; k < 96; k++) {
+        const day = k / 96;
+        const sun = 0.5 - 0.5 * Math.cos(2 * Math.PI * day);
+        strip.appendChild(svg('rect', { x: k, y: 0, width: 1.05, height: 4, fill: `rgba(255,243,207,${(0.1 + 0.5 * sun).toFixed(2)})` }));
+        const on = timerLevel(day, timerCycles(c), timerPhase(c), timerDuty(c));
+        strip.appendChild(svg('rect', { x: k, y: 5, width: 1.05, height: 7, fill: KIND_COLOR.timer, opacity: (0.1 + 0.9 * on).toFixed(2) }));
+      }
+      section.appendChild(strip);
+      section.appendChild(el('div', { class: 'editor-hint' }, 'Top: daylight over one day (midnight → noon → midnight). Bottom: when the timer is on. Its level is 1 while on, 0 while off.'));
+      box.appendChild(section);
+    }
+    left.appendChild(box);
   }
 
   private renderGrowthTab(left: HTMLElement): void {
     const d = this.design;
     const choices = el('div', { class: 'editor-choices' });
-    for (const g of ['form', 'blob', 'pattern'] as GrowthType[]) {
+    for (const g of ['form', 'blob', 'pattern', 'worm'] as GrowthType[]) {
       choices.appendChild(this.choice('growth', g, g === d.growth, GROWTH_INFO[g], false, () => this.update((x) => (x.growth = g))));
     }
     left.appendChild(choices);
@@ -358,7 +477,30 @@ export class Editor {
     if (d.growth === 'pattern') {
       settings.appendChild(this.slider('Max repeats', d.pattern.maxRepeats, 1, DESIGN.patternMaxRepeatsMax, 1, (v) => (d.pattern.maxRepeats = v)));
     }
+    if (d.growth === 'worm') {
+      settings.appendChild(this.slider('Max segments', d.pattern.maxRepeats, 1, DESIGN.patternMaxRepeatsMax, 1, (v) => (d.pattern.maxRepeats = v)));
+    }
     left.appendChild(settings);
+
+    if (d.growth === 'worm') {
+      left.appendChild(el('div', { class: 'editor-label' }, 'Head, segment and tail'));
+      left.appendChild(
+        this.toolbar([
+          ['head', 'Head'],
+          ['tail', 'Tail'],
+          ['start', 'Segment start'],
+          ['end', 'Segment end'],
+        ]),
+      );
+      left.appendChild(this.grid('motif'));
+      left.appendChild(
+        el(
+          'div',
+          { class: 'editor-hint' },
+          'Click cells to toggle them as head (H) or tail (T); every other cell is the segment. Mark where the segment starts (S) and ends (E): new segments are added from end to start, between the last segment and the tail.',
+        ),
+      );
+    }
 
     if (d.growth === 'pattern') {
       left.appendChild(el('div', { class: 'editor-label' }, 'Motif'));
@@ -444,8 +586,8 @@ export class Editor {
               g.appendChild(t);
             }
           }
-          if (isSensor(c.kind)) {
-            // Sensors face outward from the cell they're attached to.
+          if (isSensor(c.kind) || c.kind === 'tip') {
+            // Sensors face (and tips grow) outward from the cell they're attached to.
             const attach = attachDirection(d.cells, idx);
             if (attach >= 0) g.appendChild(this.facingArrow(cx, cy, (attach + 3) % 6, spacing));
           }
@@ -458,7 +600,17 @@ export class Editor {
             g.appendChild(svg('circle', { cx, cy, r: HEX_SIZE * 0.88, class: 'starter-ring' }));
           }
           if (mode === 'motif') {
-            const mark = idx === d.pattern.start ? 'S' : d.pattern.ends.includes(idx) ? 'E' : '';
+            const worm = d.growth === 'worm';
+            const mark =
+              worm && d.worm?.head.includes(idx)
+                ? 'H'
+                : worm && d.worm?.tail.includes(idx)
+                  ? 'T'
+                  : idx === d.pattern.start
+                    ? 'S'
+                    : (worm ? d.pattern.ends[0] === idx : d.pattern.ends.includes(idx))
+                      ? 'E'
+                      : '';
             if (mark) {
               const t = svg('text', { x: cx, y: cy + 4, class: `order mark-${mark}` });
               t.textContent = mark;
@@ -492,7 +644,7 @@ export class Editor {
         } else {
           root.appendChild(svg('line', { x1, y1, x2, y2, class: cls, 'stroke-width': width }));
         }
-        if (d.growth === 'pattern' && w.repeat && w.repeat !== 'same') {
+        if ((d.growth === 'pattern' || d.growth === 'worm') && w.repeat && w.repeat !== 'same') {
           const t = svg('text', { x: (x1 + x2) / 2, y: (y1 + y2) / 2 - 4, class: 'wire-repeat' });
           t.textContent = w.repeat === 'previous' ? 'prev' : 'next';
           root.appendChild(t);
@@ -521,18 +673,19 @@ export class Editor {
 
   private renderBehaviorTab(left: HTMLElement): void {
     const d = this.design;
-    if (d.growth !== 'form' && d.growth !== 'pattern') {
-      left.appendChild(el('div', { class: 'editor-hint' }, 'Behavior wiring applies to Form and Pattern designs. Choose one on the Growth tab.'));
-      return;
-    }
+    const note: Record<GrowthType, string> = {
+      form: '',
+      blob: 'Wiring applies to the body you drew; cells Blob adds later are unwired (tips that branch keep their wiring).',
+      pattern: 'Wiring drawn in the motif is copied into every repeat.',
+      worm: 'Wiring inside the segment is copied into every segment; wiring to the head uses the first segment, to the tail the last.',
+    };
     left.appendChild(
       el(
         'div',
         { class: 'editor-hint' },
         this.pendingSensor === null
-          ? 'Click a sensor or neuron, then a Jet or neuron, to connect them. Click a neuron twice to wire it to itself. ' +
-              (d.growth === 'pattern' ? 'Wiring drawn in the motif is copied into every repeat.' : '')
-          : 'Now click a Jet or neuron to connect to (click empty space to cancel).',
+          ? 'Click a sensor, timer or neuron, then a Jet, neuron or growth tip, to connect them. Click a neuron twice to wire it to itself. ' + note[d.growth]
+          : 'Now click a Jet, neuron or growth tip to connect to (click empty space to cancel).',
       ),
     );
     left.appendChild(this.grid('wire'));
@@ -579,9 +732,13 @@ export class Editor {
           toggle.appendChild(b);
         }
       };
-      // Sensors have two outputs; neurons have one.
-      if (isSensor(d.cells[w.source].kind)) choose(['level', 'change'] as const, w.output, (v) => (w.output = v));
-      if (d.growth === 'pattern') {
+      // Sensors and timers have two outputs; neurons have one.
+      if (isSensor(d.cells[w.source].kind) || d.cells[w.source].kind === 'timer') choose(['level', 'change'] as const, w.output, (v) => (w.output = v));
+      if (d.cells[w.target].kind === 'tip') {
+        toggle.appendChild(el('span', { class: 'wire-sep' }, 'drives'));
+        choose(TIP_CHANNELS, w.channel ?? 'grow', (v) => (w.channel = v));
+      }
+      if (d.growth === 'pattern' || d.growth === 'worm') {
         toggle.appendChild(el('span', { class: 'wire-sep' }, 'target in'));
         choose(['same', 'previous', 'next'] as const, w.repeat ?? 'same', (v) => (w.repeat = v));
       }
@@ -609,8 +766,8 @@ export class Editor {
       this.pendingSensor = null;
     } else if (kind && isSource(kind)) {
       this.pendingSensor = idx;
-    } else if (kind === 'jet') {
-      return this.flash('Click a sensor or neuron first, then the Jet.');
+    } else if (kind && isTarget(kind)) {
+      return this.flash('Click a sensor, timer or neuron first, then the cell it drives.');
     } else {
       this.pendingSensor = null;
     }
@@ -699,6 +856,10 @@ export class Editor {
       const shift = (i: number) => (i > idx ? i - 1 : i);
       trial.pattern.ends = trial.pattern.ends.filter((e) => e !== idx).map(shift);
       trial.pattern.start = trial.pattern.start === idx ? 0 : shift(trial.pattern.start);
+      if (trial.worm) {
+        const keep = (list: number[]) => list.filter((e) => e !== idx).map(shift);
+        trial.worm = { head: keep(trial.worm.head), tail: keep(trial.worm.tail) };
+      }
       trial.wiring = (trial.wiring ?? [])
         .filter((w) => w.source !== idx && w.target !== idx)
         .map((w) => ({ ...w, source: shift(w.source), target: shift(w.target) }));
@@ -714,16 +875,16 @@ export class Editor {
     }
     const kind = this.tool as CellKind;
     if (idx >= 0) {
-      d.cells[idx].kind = kind;
-      d.cells[idx].strength = kind === 'jet' ? (d.cells[idx].strength ?? JET.defaultStrength) : undefined;
-      if (kind !== 'proximitySensor') delete d.cells[idx].filter;
+      if (d.cells[idx].kind === kind) return;
+      // A changed cell starts with its new type's settings.
+      d.cells[idx] = freshCell(q, r, kind, Math.random);
       // Drop connections that no longer run from a source to a target.
       d.wiring = (d.wiring ?? []).filter((w) => isSource(d.cells[w.source].kind) && isTarget(d.cells[w.target].kind));
-      if (kind !== 'neuron') for (const key of ['bias', 'speed', 'inputs', 'eatenRange'] as const) delete d.cells[idx][key];
+      for (const w of d.wiring) if (d.cells[w.target].kind !== 'tip') delete w.channel;
     } else {
       if (d.cells.length >= DESIGN.maxCells) return this.flash(`A body can have at most ${DESIGN.maxCells} cells.`);
       if (d.cells.length && !d.cells.some((c) => areNeighbors(c.q, c.r, q, r))) return this.flash('New cells must touch the body.');
-      d.cells.push(kind === 'jet' ? { q, r, kind, strength: JET.defaultStrength } : { q, r, kind });
+      d.cells.push(freshCell(q, r, kind, Math.random));
       if (d.growth === 'blob') d.blob.maxCells = Math.max(d.blob.maxCells, d.cells.length);
     }
     this.message = '';
@@ -734,6 +895,29 @@ export class Editor {
     const p = this.design.pattern;
     const idx = this.design.cells.findIndex((c) => c.q === q && c.r === r);
     if (idx < 0) return;
+    if (this.design.growth === 'worm') {
+      const w = (this.design.worm ??= { head: [], tail: [] });
+      const unmark = () => {
+        w.head = w.head.filter((e) => e !== idx);
+        w.tail = w.tail.filter((e) => e !== idx);
+      };
+      if (this.tool === 'head' || this.tool === 'tail') {
+        const list = this.tool === 'head' ? w.head : w.tail;
+        const had = list.includes(idx);
+        unmark();
+        if (!had) (this.tool === 'head' ? w.head : w.tail).push(idx);
+        if (p.start === idx) p.start = -1;
+        if (p.ends[0] === idx) p.ends = [];
+      } else {
+        unmark();
+        if (this.tool === 'start') {
+          p.start = idx;
+          if (p.ends[0] === idx) p.ends = [];
+        } else if (idx !== p.start) p.ends = [idx];
+      }
+      this.render();
+      return;
+    }
     if (this.tool === 'start') {
       p.start = idx;
       p.ends = p.ends.filter((e) => e !== idx);
@@ -758,7 +942,7 @@ export class Editor {
     clearInterval(this.previewTimer);
     if (validateDesign(this.design)) return;
     const g = compileGenome(this.design);
-    const cells = this.previewCells(g.plan, g.maxCells);
+    const cells = this.previewCells(g.worm ? g.worm.plans[g.worm.maxSegments] : g.plan, g.maxCells);
     const spacing = 2 * CELL.radius * 1.5;
     const [minX, maxX, minY, maxY] = cells.reduce(
       ([a, b, c, dd], s) => {
@@ -800,19 +984,64 @@ export class Editor {
     }, 220);
   }
 
-  /** The plan, plus (for Blob) a sample of random edge growth from the cell mix. */
-  private previewCells(plan: { q: number; r: number; kind: CellKind }[], maxCells: number) {
-    const out = plan.map((c) => ({ ...c }));
+  /**
+   * The plan, plus (for Blob) a sample of further growth: through growth tips
+   * at their base signals when it has active ones, otherwise random edge growth
+   * from the cell mix. A tip that advances is drawn again at its new spot, with
+   * the cell it leaves behind drawn over its old one.
+   */
+  private previewCells(plan: { q: number; r: number; kind: CellKind; push?: number; deposit?: CellKind[]; turn?: number; branch?: number; grow?: number }[], maxCells: number) {
+    const out = plan.map((c) => ({ q: c.q, r: c.r, kind: c.kind }));
     if (this.design.growth !== 'blob') return out;
     const rng = createRng(1234);
     const taken = new Set(out.map((c) => hexKey(c.q, c.r)));
+    // Tips at their base signals (wired inputs aren't known in the editor).
+    const tips = plan
+      .filter((c) => c.kind === 'tip' && tipGrow(c as never) > TIP.growThreshold)
+      .map((c) => ({ q: c.q, r: c.r, dir: c.push !== undefined && c.push >= 0 ? (c.push + 3) % 6 : 0, n: 0, since: 0, cell: c }));
+    let size = out.length;
+    for (let round = 0; tips.length && size < maxCells && round < 400; round++) {
+      let moved = false;
+      for (const t of [...tips]) {
+        if (size >= maxCells) break;
+        const turn = t.cell.turn ?? 0;
+        if (turn > TIP.turnThreshold) t.dir = (t.dir + 5) % 6;
+        else if (turn < -TIP.turnThreshold) t.dir = (t.dir + 1) % 6;
+        const fq = t.q + HEX_DIRS[t.dir][0];
+        const fr = t.r + HEX_DIRS[t.dir][1];
+        if (taken.has(hexKey(fq, fr))) continue;
+        const deposit = tipDeposit(t.cell as never);
+        out.push({ q: t.q, r: t.r, kind: deposit[t.n++ % deposit.length] });
+        taken.add(hexKey(fq, fr));
+        out.push({ q: fq, r: fr, kind: 'tip' });
+        const [oq, or] = [t.q, t.r];
+        t.q = fq;
+        t.r = fr;
+        size++;
+        moved = true;
+        if ((t.cell.branch ?? 0) > TIP.branchThreshold && ++t.since >= TIP.branchCooldown && size < maxCells) {
+          const side = (t.dir + (t.n % 2 ? 1 : 5)) % 6;
+          const bq = oq + HEX_DIRS[side][0];
+          const br = or + HEX_DIRS[side][1];
+          if (!taken.has(hexKey(bq, br))) {
+            taken.add(hexKey(bq, br));
+            out.push({ q: bq, r: br, kind: 'tip' });
+            tips.push({ q: bq, r: br, dir: side, n: t.n, since: 0, cell: t.cell });
+            size++;
+            t.since = 0;
+          }
+        }
+      }
+      if (!moved) break;
+    }
+    if (tips.length) return out;
     const mix = bodyMix(this.design);
     const pick = (): CellKind => {
       let roll = rng() * CELL_KINDS.reduce((sum, k) => sum + mix[k], 0);
       for (const k of CELL_KINDS) if ((roll -= mix[k]) < 0) return k;
       return this.design.cells[0].kind;
     };
-    for (let tries = 0; out.length < maxCells && tries < 2000; tries++) {
+    for (let tries = 0; size < maxCells && tries < 2000; tries++) {
       const from = out[Math.floor(rng() * out.length)];
       const [dq, dr] = HEX_DIRS[Math.floor(rng() * 6)];
       const q = from.q + dq;
@@ -820,6 +1049,7 @@ export class Editor {
       if (taken.has(hexKey(q, r))) continue;
       taken.add(hexKey(q, r));
       out.push({ q, r, kind: pick() });
+      size++;
     }
     return out;
   }
@@ -828,8 +1058,8 @@ export class Editor {
     const box = el('div', { class: 'editor-stats' });
     if (validateDesign(this.design)) return box;
     const s = designStats(this.design);
-    // Decomposers pay a reduced upkeep.
-    const upkeepCells = s.cells - s.kinds.decomposer * (1 - METABOLISM.decomposerUpkeep);
+    // Support cells pay reduced upkeep (per-type multipliers).
+    const upkeepCells = CELL_KINDS.reduce((sum, k) => sum + s.kinds[k] * (METABOLISM.typeUpkeep[k] ?? 1), 0);
     const perTick = (m: number) => ((upkeepCells * METABOLISM.upkeep * m) / SIM.tickHz).toFixed(2);
     const rows: [string, string][] = [
       [

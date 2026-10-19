@@ -268,6 +268,10 @@ export class ClientSession implements GameSource {
     this.conn.send({ t: 'view', ...v });
   }
 
+  stepMs(): number | null {
+    return null;
+  }
+
   stats(): { water: number; cells: number } | null {
     return this.debug ? this.totals : null;
   }

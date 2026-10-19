@@ -1,10 +1,23 @@
 import { CURRENTS, WORLD } from '../config';
 import { createNoise2D, fbm } from './noise';
 
-/** Current per tile: direction (radians) and strength (world units per second). */
+/** Current per tile: direction (radians) and strength (world units per second), and the same as a velocity. */
 export interface CurrentField {
   dir: Float32Array;
   strength: Float32Array;
+  vx: Float32Array;
+  vy: Float32Array;
+}
+
+/** Builds the velocity form of a field sent as direction and strength. */
+export function currentField(dir: Float32Array, strength: Float32Array): CurrentField {
+  const vx = new Float32Array(dir.length);
+  const vy = new Float32Array(dir.length);
+  for (let i = 0; i < dir.length; i++) {
+    vx[i] = Math.cos(dir[i]) * strength[i];
+    vy[i] = Math.sin(dir[i]) * strength[i];
+  }
+  return { dir, strength, vx, vy };
 }
 
 /**
@@ -27,13 +40,15 @@ export function generateCurrents(rng: () => number, width: number, height: numbe
     }
   }
 
+  // Soft cap: where streams overlap, speed approaches maxSpeed instead of adding up.
   const dir = new Float32Array(n);
   const strength = new Float32Array(n);
+  const cap = CURRENTS.maxSpeed;
   for (let i = 0; i < n; i++) {
     dir[i] = Math.atan2(vy[i], vx[i]);
-    strength[i] = Math.hypot(vx[i], vy[i]);
+    strength[i] = cap * Math.tanh(Math.hypot(vx[i], vy[i]) / cap);
   }
-  return { dir, strength };
+  return currentField(dir, strength);
 }
 
 /** Weak background drift: the curl of a noise stream function, faded to run parallel to edges. */
@@ -57,19 +72,28 @@ function addCalmWater(
   }
   const cx = new Float32Array(width * height);
   const cy = new Float32Array(width * height);
-  let max = 1e-9;
+  let sum = 0;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const i = y * width + x;
       cx[i] = (psi[Math.min(height - 1, y + 1) * width + x] - psi[Math.max(0, y - 1) * width + x]) / 2;
       cy[i] = -(psi[y * width + Math.min(width - 1, x + 1)] - psi[y * width + Math.max(0, x - 1)]) / 2;
-      max = Math.max(max, Math.hypot(cx[i], cy[i]));
+      sum += Math.hypot(cx[i], cy[i]);
     }
   }
-  const scale = CURRENTS.calmSpeed / max;
+  // Scaled so the typical (mean) drift is calmSpeed, clamped so no calm spot gets stream-fast.
+  const scale = CURRENTS.calmSpeed / Math.max(1e-9, sum / cx.length);
+  const maxCalm = CURRENTS.calmSpeed * CURRENTS.calmMaxFactor;
   for (let i = 0; i < cx.length; i++) {
-    vx[i] += cx[i] * scale;
-    vy[i] += cy[i] * scale;
+    let sx = cx[i] * scale;
+    let sy = cy[i] * scale;
+    const m = Math.hypot(sx, sy);
+    if (m > maxCalm) {
+      sx *= maxCalm / m;
+      sy *= maxCalm / m;
+    }
+    vx[i] += sx;
+    vy[i] += sy;
   }
 }
 
@@ -176,7 +200,7 @@ function stampPath(
 
 /** Current at a world position, interpolated between the four nearest tile centers. */
 export function sampleCurrent(field: CurrentField, px: number, py: number, out: { x: number; y: number }): void {
-  const { dir, strength } = field;
+  const { vx, vy } = field;
   const fx = Math.min(WORLD.width - 1, Math.max(0, px / WORLD.tileSize - 0.5));
   const fy = Math.min(WORLD.height - 1, Math.max(0, py / WORLD.tileSize - 0.5));
   const x0 = Math.floor(fx);
@@ -185,16 +209,14 @@ export function sampleCurrent(field: CurrentField, px: number, py: number, out: 
   const y1 = Math.min(WORLD.height - 1, y0 + 1);
   const tx = fx - x0;
   const ty = fy - y0;
-  let sx = 0;
-  let sy = 0;
-  const add = (i: number, wgt: number) => {
-    sx += Math.cos(dir[i]) * strength[i] * wgt;
-    sy += Math.sin(dir[i]) * strength[i] * wgt;
-  };
-  add(y0 * WORLD.width + x0, (1 - tx) * (1 - ty));
-  add(y0 * WORLD.width + x1, tx * (1 - ty));
-  add(y1 * WORLD.width + x0, (1 - tx) * ty);
-  add(y1 * WORLD.width + x1, tx * ty);
-  out.x = sx;
-  out.y = sy;
+  const a = y0 * WORLD.width + x0;
+  const b = y0 * WORLD.width + x1;
+  const c = y1 * WORLD.width + x0;
+  const d = y1 * WORLD.width + x1;
+  const wa = (1 - tx) * (1 - ty);
+  const wb = tx * (1 - ty);
+  const wc = (1 - tx) * ty;
+  const wd = tx * ty;
+  out.x = vx[a] * wa + vx[b] * wb + vx[c] * wc + vx[d] * wd;
+  out.y = vy[a] * wa + vy[b] * wb + vy[c] * wc + vy[d] * wd;
 }

@@ -1,8 +1,8 @@
 // All tuning numbers live here.
 
 export const WORLD = {
-  width: 256, // grid tiles
-  height: 192, // grid tiles
+  width: 362, // grid tiles
+  height: 272, // grid tiles
   tileSize: 16, // world units per grid tile
 };
 
@@ -18,6 +18,7 @@ export const DEPTH = {
 export const TEMPERATURE = {
   center: 30, // °C at the world center
   edge: 4, // °C at the corners
+  depthCooling: 8, // °C colder at the deepest point than at the surface (deep water lowers metabolism)
 };
 
 export const LIGHT = {
@@ -28,20 +29,38 @@ export const LIGHT = {
 };
 
 export const NUTRIENT = {
-  total: 1_000_000, // integer units in the whole world, conserved forever
+  total: 2_000_000, // integer units in the whole world, conserved forever
+};
+
+/** Water nutrient carried by currents (integer donor-cell advection) and slow diffusion. */
+export const NUTRIENT_FLOW = {
+  intervalTicks: 15, // ticks between flow steps (each step moves a whole interval's worth)
+  diffusion: 0.01, // fraction of a tile's nutrient that spreads to each of its 4 neighbors per step
+  maxOutflow: 0.5, // most of a tile's nutrient that can leave it in one step
+};
+
+/** Hydrothermal vents: rare spots in deep water that feed Chemosynth cells, day and night. */
+export const VENTS = {
+  count: 4, // vents per world
+  minDepthFraction: 0.65, // vents only form where depth is at least this fraction of the depth range
+  radius: 8, // tiles, Gaussian falloff of a vent's strength
+  minSpacing: 50, // tiles between vents
+  attempts: 4000, // placement tries
 };
 
 // ---------------------------------------------------------------- simulation
 
 export const CURRENTS = {
-  calmSpeed: 1, // world units per second of background drift in calm water
+  calmSpeed: 3, // world units per second of typical (mean) background drift in calm water
+  calmMaxFactor: 2, // background drift is clamped at this multiple of calmSpeed
   calmNoiseScale: 0.015, // background drift noise frequency per grid tile
   edgeFalloff: 12, // tiles over which background drift turns parallel to the world edge
-  streams: 6, // number of streams per world
+  streams: 10, // number of streams per world
   loopChance: 0.35, // chance a stream is a closed loop
-  streamSpeed: 10, // world units per second at the core of the strongest stream
-  streamSpeedMin: 0.6, // weakest stream, as a fraction of streamSpeed
-  streamWidth: 5, // tiles, Gaussian half-width of a stream
+  streamSpeed: 7, // world units per second at the core of the strongest stream
+  streamSpeedMin: 0.5, // weakest stream, as a fraction of streamSpeed
+  streamWidth: 9, // tiles, Gaussian half-width of a stream
+  maxSpeed: 8, // soft cap: overlapping streams approach this speed but never exceed it
   streamLengthMin: 120, // tiles, open streams
   streamLengthMax: 280,
   curveJitter: 0.004, // change in turn rate per tile, radians
@@ -58,9 +77,10 @@ export const SIM = {
   tickHz: 30, // simulation ticks per second at 1x speed
   speedMin: 0.25, // debug speed slider range (multiplier)
   speedMax: 8,
-  maxCells: 16384,
-  maxBonds: 49152,
-  maxOrganisms: 16384,
+  maxCells: 32768, // network cell ids are 16-bit, so at most 65536
+  maxBonds: 98304,
+  maxOrganisms: 32768,
+  waterFrameEvery: 15, // the worker sends the water nutrient field to the main thread every this many ticks
 };
 
 export const CELL = {
@@ -78,18 +98,53 @@ export const LEAF = {
 
 export const ROOT = {
   absorbRate: 5, // nutrient units per second moved from the water into its store (faster than Leaf)
-  storedNutrientCap: 64, // much larger store than other cells
+  absorbRadius: 2, // tiles around the Root it absorbs from (each unit comes from the richest tile in range)
+  storedNutrientCap: 24, // somewhat larger store than other cells
 };
 
 export const FAT = {
   maxEnergy: 400, // much larger energy cap than other cells
   keepNeighborsAt: 0.8, // Fat takes a bonded neighbor's energy above this fraction of its cap, and gives back below it
-  reserve: 10, // energy a Fat cell keeps for itself and never gives away
+  reserve: 25, // energy a Fat cell keeps for itself and never gives away; below it, it fills up like a normal cell
+  storedNutrientCap: 64, // Fat also stores nutrient: a much larger store than other cells
 };
 
 export const SPIKE = {
-  drainRate: 12, // energy per second drained from each touching cell of another organism; the Spike gains nothing
-  touchDistance: 2.2, // in cell radii, center to center
+  retaliation: 40, // energy per second a Mouth loses while it bites a Spike (more than the Mouth gains)
+};
+
+export const SHELL = {
+  mouthDrainFactor: 0.25, // Mouths drain a Shell at this fraction of their normal rate
+};
+
+export const FILTER = {
+  energyRate: 5, // energy per second at full flow through the cell in full-nutrient water
+  absorbRate: 2, // nutrient units per second at full flow
+  fullSpeed: 6, // water speed relative to the cell (world units/s) that counts as full flow
+  fullNutrient: 20, // water nutrient per tile that counts as full
+};
+
+export const CHEMOSYNTH = {
+  rate: 7, // energy per second at the center of a vent (vent strength 1)
+  absorbRate: 1.5, // nutrient units per second it moves from the water into its store (like a Leaf)
+};
+
+/** Timer: a clock cell whose output follows the time of day. */
+export const TIMER = {
+  maxCycles: 8, // most on/off cycles per day
+  cyclesSpread: 0.8, // new timers: how far beyond 1 cycle per day the random start reaches (exponential)
+  edge: 0.04, // fraction of a cycle over which the output ramps between off and on
+};
+
+/** Growth tip: an advancing tip that grows the spot it faces and moves onto it. */
+export const TIP = {
+  defaultGrow: 1, // base Grow signal for tips placed in the editor
+  growThreshold: 0.5, // a tip advances only while its Grow signal is above this
+  turnThreshold: 0.5, // a Turn signal above this turns the tip 60° right before advancing (below minus this: left)
+  branchThreshold: 0.5, // a Branch signal above this also starts a new tip at its side
+  branchCooldown: 3, // advances a tip must make between branches
+  stuckChecks: 6, // growth checks with every active tip blocked before a Blob grows one random edge cell
+  maxDeposit: 4, // longest list of cell types a tip leaves behind
 };
 
 export const DECOMPOSER = {
@@ -130,9 +185,28 @@ export const MOUTH = {
 
 export const METABOLISM = {
   upkeep: 0.6, // energy per second per living cell at multiplier 1
-  decomposerUpkeep: 0.4, // Decomposer upkeep as a fraction of the normal upkeep
+  /** Upkeep multiplier per cell type (absent = 1). Support cells cost less to keep. */
+  typeUpkeep: {
+    decomposer: 0.4,
+    fat: 0.5,
+    neuron: 0.5,
+    lightSensor: 0.6,
+    nutrientSensor: 0.6,
+    temperatureSensor: 0.6,
+    touchSensor: 0.6,
+    proximitySensor: 0.6,
+    shell: 0.2,
+    tip: 0.5,
+    timer: 0.5,
+  } as Record<string, number>,
   coldMultiplier: 0.5, // upkeep multiplier at TEMPERATURE.edge
   warmMultiplier: 1.5, // upkeep multiplier at TEMPERATURE.center
+};
+
+/** Colony discount: cells of bigger organisms pay less upkeep each. */
+export const COLONY = {
+  maxDiscount: 0.3, // upkeep reduction at full colony size
+  fullSize: 8, // cells in an organism for the full discount (scales linearly from 1 cell)
 };
 
 export const BONDS = {
@@ -144,10 +218,11 @@ export const BONDS = {
 
 export const GROWTH = {
   checkInterval: 10, // ticks between growth/reproduction checks per organism
-  energyLoss: 0.5, // fraction of the energy spent to add a cell that is lost; the rest starts the new cell
+  energyLoss: 0.3, // fraction of the energy spent to add a cell that is lost; the rest starts the new cell
   lostMemory: 32, // lost cell spots an organism remembers, to regrow first
   keepEnergy: 10, // energy a cell must keep after paying for a new cell or bud (so it doesn't starve right after)
   launchSpeed: 150, // world units per second given to offspring at launch strength 1 (water drag slows them)
+  budShare: 0.25, // a bud also gets this share of the organism's spare energy and stored nutrient
 };
 
 /** Organism designs (editor) and their limits. */
@@ -168,6 +243,7 @@ export const DESIGN = {
 
 export const DEAD = {
   decayChance: 0.005, // chance per tick that a dead cell returns 1 nutrient unit
+  sinkSpeed: 2, // world units per second dead cells drift toward deeper water ("marine snow")
 };
 
 export const PHYSICS = {
@@ -191,6 +267,15 @@ export const WATER = {
   shallowColor: 0x072832,
   shallowPower: 1.8, // >1 keeps more of the world dark
   nightFloor: 0.35, // water brightness multiplier at midnight
+};
+
+/** Vent glow drawn over the water. */
+export const VENT_RENDER = {
+  color: 0xff7a3d,
+  size: 1.6, // glow diameter, as a multiple of the vent's diameter (2 × VENTS.radius)
+  alphaDay: 0.12,
+  alphaNight: 0.3,
+  shimmerHz: 0.25,
 };
 
 export const OVERLAY = {
@@ -239,6 +324,11 @@ export const CELL_STYLE = {
   touchSensor: { color: 0xff9ff3, glow: 0xffb8f6, mark: 0xffe8fc, markSize: 1.7, membraneScale: 1 },
   proximitySensor: { color: 0x7ae8ff, glow: 0x9aeeff, mark: 0xe0faff, markSize: 1.7, membraneScale: 1 },
   neuron: { color: 0xd8c8ff, glow: 0xf0e8ff, mark: 0xffffff, markSize: 1.1, membraneScale: 0.85 },
+  chemosynth: { color: 0xff6a3d, glow: 0xff7a40, mark: 0xffd2b8, markSize: 1.3, membraneScale: 1 },
+  filter: { color: 0x8fe8e0, glow: 0xa8fff4, mark: 0xe0fffb, markSize: 1.9, membraneScale: 1 },
+  shell: { color: 0xe8e2f2, glow: 0xd8d0ea, mark: 0xfaf6ff, markSize: 1.6, membraneScale: 1.05 },
+  tip: { color: 0x9dff5c, glow: 0xc4ff8a, mark: 0xf0ffe0, markSize: 1.4, membraneScale: 0.95 },
+  timer: { color: 0xffc9f0, glow: 0xffd8f4, mark: 0xfff0fb, markSize: 1.4, membraneScale: 0.9 },
   dead: { color: 0x6b7378, glow: 0x000000, mark: 0x50585c, markSize: 0.7, membraneScale: 1 },
 };
 
@@ -283,6 +373,7 @@ export const NETWORK = {
   positionHz: 15, // position updates per second sent to each client
   viewMargin: 240, // world units around a client's view that still get positions
   nutrientIntervalSec: 1, // how often changed nutrient tiles are sent
+  nutrientDiffMin: 2, // a tile is re-sent once it differs from its last sent value by at least this (or reaches/leaves 0)
   inspectHz: 10, // hover info updates per second sent to each client
   statsHz: 2, // debug stats (nutrient totals) per second
   viewSendHz: 10, // max camera view updates per second from a client
@@ -318,6 +409,11 @@ export const DNA = {
     touchSensor: 3,
     proximitySensor: 3,
     neuron: 3,
+    chemosynth: 4,
+    filter: 4,
+    shell: 3,
+    tip: 4,
+    timer: 3,
   },
 };
 
@@ -356,6 +452,15 @@ export const MUTATION = {
   mixShift: 0.1, // fraction of the Blob mix moved from one kind to another
   biasNudge: 0.15, // max change to a neuron's bias
   speedNudge: 0.1, // max change to a neuron's speed
+  inputNudge: 0.15, // max change to a neuron's internal input weight
+  launchNudge: 0.1, // max change to launch strength
+  rateNudge: 0.05, // max change to the mutation rate itself
+  tipNudge: 0.15, // max change to a growth tip's base Grow, Turn or Branch
+  cellsPerRoll: 4, // bigger bodies mutate more: each structural mutation gets one extra roll per this many cells
+  maxRolls: 12, // most rolls of one structural mutation per offspring
+  timerNudge: 0.05, // max change to a timer's phase and duty
+  burstChance: 0.05, // chance an offspring mutates at burstFactor times the usual rates
+  burstFactor: 4,
 };
 
 export const NEURON_INPUTS = {

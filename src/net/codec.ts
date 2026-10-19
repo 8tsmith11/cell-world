@@ -16,7 +16,7 @@ export function tagOf(buf: ArrayBuffer): number {
 // [tag][f32 time][u32 recordCount][f32 records * EVENT_STRIDE][u32 water * tiles]
 // Records use the event layout: cells with kind = Born, then bonds with kind = BondAdded.
 
-export function encodeSnapshot(frame: FrameMsg): ArrayBuffer {
+export function encodeSnapshot(frame: FrameMsg & { waterNutrient: Uint32Array }): ArrayBuffer {
   const records: number[] = [];
   for (let i = 0; i < frame.cellCount; i++) {
     if (frame.cellType[i] === CellType.None) continue;

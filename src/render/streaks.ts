@@ -56,7 +56,7 @@ export class Streaks {
 
   setField(field: CurrentField): void {
     this.field = field;
-    this.maxStrength = CURRENTS.streamSpeed;
+    this.maxStrength = CURRENTS.maxSpeed;
     for (let i = 0; i < OVERLAY.streakCount; i++) this.age[i] = Infinity;
   }
 

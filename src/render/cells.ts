@@ -125,6 +125,34 @@ function buildTextures() {
       temperatureSensor: antenna,
       touchSensor: antenna,
       proximitySensor: antenna,
+      // Chemosynth: a vent dot with rising heat rings.
+      chemosynth: makeTexture(64, (u, v) => [
+        1,
+        Math.max(dot(u, v, 0, 0.25, 0.26), ring(u, v + 0.15, 0.45, 0.08) * 0.8 * (v < 0.2 ? 1 : 0), ring(u, v + 0.3, 0.72, 0.07) * 0.6 * (v < 0 ? 1 : 0)),
+      ]),
+      // Filter: a fringe of fine cilia around the edge.
+      filter: makeTexture(64, (u, v) => {
+        const d = Math.hypot(u, v);
+        if (d < 0.55 || d > 0.98) return [1, 0];
+        const n = 14;
+        const a = Math.atan2(v, u) * (n / (Math.PI * 2));
+        const off = Math.abs(a - Math.round(a));
+        return [1, Math.max(0, Math.min(1, (0.12 - off) * 14)) * 0.9];
+      }),
+      // Shell: nested nacre layers.
+      shell: makeTexture(64, (u, v) => [1, Math.max(ring(u, v, 0.78, 0.09), ring(u, v, 0.52, 0.08) * 0.75, ring(u, v, 0.26, 0.08) * 0.5)]),
+      // Growth tip: a bud with an arrow pointing the way it grows (texture points +x).
+      tip: makeTexture(64, (u, v) => [
+        1,
+        Math.max(
+          dot(u, v, -0.2, 0, 0.3) * 0.8,
+          segment(u, v, -0.2, 0, 0.6, 0, 0.09),
+          segment(u, v, 0.62, 0, 0.3, 0.3, 0.09),
+          segment(u, v, 0.62, 0, 0.3, -0.3, 0.09),
+        ),
+      ]),
+      // Timer: a clock face.
+      timer: makeTexture(64, (u, v) => [1, Math.max(ring(u, v, 0.72, 0.08), segment(u, v, 0, 0, 0, -0.5, 0.08), segment(u, v, 0, 0, 0.35, 0.12, 0.08))]),
       // Neuron: a small bright node.
       neuron: makeTexture(32, (u, v) => {
         const d = Math.hypot(u, v);
@@ -204,6 +232,11 @@ const MARK_BLEND: Record<StyleKey, 'normal' | 'add'> = {
   touchSensor: 'add',
   proximitySensor: 'add',
   neuron: 'add',
+  chemosynth: 'add',
+  filter: 'add',
+  shell: 'add',
+  tip: 'add',
+  timer: 'add',
   dead: 'normal',
 };
 
@@ -248,9 +281,25 @@ export class CellView {
     this.container.addChild(this.wireLines, bridgeLayer, membraneLayer, marksLayer, cueLayer, glowLayer, this.ring);
   }
 
-  /** `ownerColor` gives each player's color, for the thin outline on their organisms. */
-  draw(frame: RenderCells, daylight: number, inspectId: number, zoom: number, ownerColor: (owner: number) => number): void {
+  /**
+   * `ownerColor` gives each player's color, for the thin outline on their
+   * organisms. Only cells, bonds and wires inside `view` (plus a margin) are drawn.
+   */
+  draw(
+    frame: RenderCells,
+    daylight: number,
+    inspectId: number,
+    zoom: number,
+    ownerColor: (owner: number) => number,
+    view: { x: number; y: number; w: number; h: number },
+  ): void {
     const r = CELL.radius;
+    const margin = r * CELL_RENDER.glowRadius * 2;
+    const x0 = view.x - margin;
+    const y0 = view.y - margin;
+    const x1 = view.x + view.w + margin;
+    const y1 = view.y + view.h + margin;
+    const inView = (i: number) => frame.cellX[i] >= x0 && frame.cellX[i] <= x1 && frame.cellY[i] >= y0 && frame.cellY[i] <= y1;
     const glowAlpha = CELL_RENDER.glowDay + (CELL_RENDER.glowNight - CELL_RENDER.glowDay) * (1 - daylight);
     const { cellType, cellX, cellY, cellAngle, cellEnergy, cellNutrient, cellDrained, cellFiring, cellOwner, cellSignal } = frame;
     const now = performance.now() / 1000;
@@ -260,7 +309,7 @@ export class CellView {
 
     for (let i = 0; i < frame.cellCount; i++) {
       const type = cellType[i];
-      if (type === CellType.None) continue;
+      if (type === CellType.None || !inView(i)) continue;
       const x = cellX[i];
       const y = cellY[i];
       const key = TYPE_STYLE[type] as StyleKey;
@@ -311,7 +360,7 @@ export class CellView {
     for (let k = 0; k < bonds.length; k += 2) {
       const a = bonds[k];
       const b = bonds[k + 1];
-      if (a >= frame.cellCount || b >= frame.cellCount || !cellType[a] || !cellType[b]) continue;
+      if (a >= frame.cellCount || b >= frame.cellCount || !cellType[a] || !cellType[b] || !(inView(a) || inView(b))) continue;
       const dx = cellX[b] - cellX[a];
       const dy = cellY[b] - cellY[a];
       const ca = styleOf(cellType[a]).color;
@@ -335,7 +384,7 @@ export class CellView {
     for (let k = 0; k < wires.length; k += 3) {
       const a = wires[k];
       const b = wires[k + 1];
-      if (a >= frame.cellCount || b >= frame.cellCount || !cellType[a] || !cellType[b] || a === b) continue;
+      if (a >= frame.cellCount || b >= frame.cellCount || !cellType[a] || !cellType[b] || a === b || !(inView(a) || inView(b))) continue;
       const w = wires[k + 2];
       g.moveTo(cellX[a], cellY[a])
         .lineTo(cellX[b], cellY[b])

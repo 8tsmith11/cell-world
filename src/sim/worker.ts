@@ -13,6 +13,7 @@ const post = (msg: FromWorker, transfer: Transferable[] = []) => scope.postMessa
 
 function generate(seed: number): void {
   sim = new Sim(seed);
+  forceWater = true;
   inspectIds = [];
   const { world } = sim;
   const msg: WorldMsg = {
@@ -24,8 +25,19 @@ function generate(seed: number): void {
     temperature: world.temperature.slice(),
     currentDir: world.currentDir.slice(),
     currentStrength: world.currentStrength.slice(),
+    currentVx: world.currentVx.slice(),
+    currentVy: world.currentVy.slice(),
+    chem: world.chem.slice(),
   };
-  post(msg, [msg.depth.buffer, msg.temperature.buffer, msg.currentDir.buffer, msg.currentStrength.buffer]);
+  post(msg, [
+    msg.depth.buffer,
+    msg.temperature.buffer,
+    msg.currentDir.buffer,
+    msg.currentStrength.buffer,
+    msg.currentVx.buffer,
+    msg.currentVy.buffer,
+    msg.chem.buffer,
+  ]);
 }
 
 function inspect(s: Sim, i: number): CellInfo | null {
@@ -48,6 +60,7 @@ function inspect(s: Sim, i: number): CellInfo | null {
     sensorLevel: s.sensorLevel[i],
     sensorChange: s.sensorChange[i],
     neuronOutput: s.neuronOut[i],
+    tipSignal: [s.tipSignal[i * 3], s.tipSignal[i * 3 + 1], s.tipSignal[i * 3 + 2]],
     org:
       o < 0
         ? null
@@ -73,8 +86,26 @@ function bondPairs(s: Sim): Int32Array {
   return Int32Array.from(pairs);
 }
 
+function ownersOf(s: Sim, n: number): Int32Array {
+  const out = new Int32Array(n);
+  const owner = s.lineages.owner;
+  for (let i = 0; i < n; i++) out[i] = owner[s.cellLineage[i]];
+  return out;
+}
+
+/** Average ms per simulated tick, measured over the last interval that ran ticks. */
+let stepMs = 0;
+/** Tick of the last water nutrient sent, so it goes out every SIM.waterFrameEvery ticks (and on demand). */
+let lastWaterTick = -Infinity;
+let forceWater = true;
+
 function postFrame(s: Sim): void {
   const n = s.cellCount;
+  const sendWater = forceWater || s.tick - lastWaterTick >= SIM.waterFrameEvery;
+  if (sendWater) {
+    lastWaterTick = s.tick;
+    forceWater = false;
+  }
   let living = 0;
   let dead = 0;
   let cellNutrient = 0;
@@ -108,9 +139,10 @@ function postFrame(s: Sim): void {
     bonds: bondPairs(s),
     cellOrganism: s.organism.slice(0, n),
     cellLineage: s.cellLineage.slice(0, n),
-    cellOwner: Int32Array.from(s.cellLineage.subarray(0, n), (l) => s.lineages.owner[l]),
+    cellOwner: ownersOf(s, n),
     events: s.drainEvents(),
-    waterNutrient: water.slice(),
+    waterNutrient: sendWater ? water.slice() : null,
+    stepMs,
     living,
     dead,
     organisms,
@@ -134,7 +166,7 @@ function postFrame(s: Sim): void {
     msg.cellLineage.buffer,
     msg.cellOwner.buffer,
     msg.events.buffer,
-    msg.waterNutrient.buffer,
+    ...(msg.waterNutrient ? [msg.waterNutrient.buffer] : []),
   ]);
 }
 
@@ -174,10 +206,14 @@ setInterval(() => {
   if (!sim) return;
   if (!paused) {
     pendingTicks += speed;
+    let ran = 0;
+    const t0 = performance.now();
     while (pendingTicks >= 1) {
       sim.step(dt);
       pendingTicks -= 1;
+      ran++;
     }
+    if (ran > 0) stepMs = (performance.now() - t0) / ran;
   }
   postFrame(sim);
   if (sim.lineageReport) {

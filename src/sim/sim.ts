@@ -1,7 +1,14 @@
 import {
   BONDS,
   CELL,
+  CHEMOSYNTH,
+  COLONY,
   DEAD,
+  FILTER,
+  NUTRIENT_FLOW,
+  SHELL,
+  TIMER,
+  TIP,
   DECOMPOSER,
   DESIGN,
   FAT,
@@ -38,14 +45,21 @@ import {
   NEURON_INPUT_KEYS,
   neuronBias,
   neuronSpeed,
+  timerCycles,
+  timerDuty,
+  timerPhase,
+  tipDeposit,
+  tipGrow,
   bodyMix,
   CELL_KINDS,
   type CellKind,
+  type ProximityFilter,
+  type SlotWire,
 } from './genome';
 import { type ExtinctionEvent, type LineageStats, Lineages } from './lineages';
 import { mutate } from './mutation';
 import { createRng } from './rng';
-import { generateWorld, stepWorld, type World } from './world';
+import { dayPhase, generateWorld, stepNutrientFlow, stepWorld, type World } from './world';
 
 export const CellType = {
   None: 0,
@@ -63,6 +77,11 @@ export const CellType = {
   TouchSensor: 12,
   ProximitySensor: 13,
   Neuron: 14,
+  Chemosynth: 15,
+  Filter: 16,
+  Shell: 17,
+  Tip: 18,
+  Timer: 19,
 } as const;
 export const CELL_TYPE_NAMES = [
   'None',
@@ -80,6 +99,11 @@ export const CELL_TYPE_NAMES = [
   'Touch sensor',
   'Proximity sensor',
   'Neuron',
+  'Chemosynth',
+  'Filter',
+  'Shell',
+  'Growth tip',
+  'Timer',
 ];
 export const isSensorType = (t: number) => t >= CellType.LightSensor && t <= CellType.ProximitySensor;
 const KIND_TYPE = {
@@ -96,6 +120,11 @@ const KIND_TYPE = {
   touchSensor: CellType.TouchSensor,
   proximitySensor: CellType.ProximitySensor,
   neuron: CellType.Neuron,
+  chemosynth: CellType.Chemosynth,
+  filter: CellType.Filter,
+  shell: CellType.Shell,
+  tip: CellType.Tip,
+  timer: CellType.Timer,
 } as const;
 /** Style key (see CELL_STYLE in config) for each cell type. */
 export const TYPE_STYLE = [
@@ -114,12 +143,39 @@ export const TYPE_STYLE = [
   'touchSensor',
   'proximitySensor',
   'neuron',
+  'chemosynth',
+  'filter',
+  'shell',
+  'tip',
+  'timer',
 ] as const;
+/** Upkeep multiplier per cell type (METABOLISM.typeUpkeep, 1 where absent). */
+const TYPE_UPKEEP = TYPE_STYLE.map((k) => METABOLISM.typeUpkeep[k] ?? 1);
+
+/** Most bonds one cell can have (hex neighbors are 6; a little headroom). */
+const BOND_SLOTS = 8;
+const SQRT3_2 = Math.sqrt(3) / 2;
+/** Angle of the hex direction (dq, dr) in the organism's layout. */
+const hexAngle = (dq: number, dr: number) => Math.atan2(dr * SQRT3_2, dq + dr / 2);
+
+/**
+ * A timer's level: 1 while on, 0 while off, following the time of day. It
+ * switches on at `phase` of each cycle and stays on for `duty` of it, with
+ * edges ramped over TIMER.edge of a cycle.
+ */
+export function timerLevel(day: number, cycles: number, phase: number, duty: number): number {
+  if (duty <= 0) return 0;
+  if (duty >= 1) return 1;
+  const p = (((day * cycles - phase) % 1) + 1) % 1; // position in the cycle; 0 = switch-on
+  const e = Math.min(TIMER.edge, duty / 2);
+  return Math.min(1, Math.max(0, Math.min(p, duty - p) / e));
+}
 
 /** Energy a cell of this type can hold. Fat holds much more. */
 export const energyCap = (type: number) => (type === CellType.Fat ? FAT.maxEnergy : CELL.maxEnergy);
-/** Stored nutrient a cell of this type can hold. Root holds much more. */
-export const storedCap = (type: number) => (type === CellType.Root ? ROOT.storedNutrientCap : CELL.storedNutrientCap);
+/** Stored nutrient a cell of this type can hold. Fat holds much more, Root somewhat more. */
+export const storedCap = (type: number) =>
+  type === CellType.Fat ? FAT.storedNutrientCap : type === CellType.Root ? ROOT.storedNutrientCap : CELL.storedNutrientCap;
 
 /**
  * Events, recorded for network replication. Each event is EVENT_STRIDE numbers.
@@ -181,6 +237,23 @@ export class Sim {
   readonly sensorLevel = new Float32Array(SIM.maxCells);
   private sensorAvg = new Float32Array(SIM.maxCells);
   readonly sensorChange = new Float32Array(SIM.maxCells);
+  /**
+   * Growth tips: the hex direction they grow (in their organism's layout),
+   * their Grow/Turn/Branch signals (3 per cell) and base values, the cell types
+   * they leave behind (up to TIP.maxDeposit, as CellType) and how many, how
+   * many cells they've left behind, and advances since they last branched.
+   */
+  readonly tipDir = new Int8Array(SIM.maxCells);
+  readonly tipSignal = new Float32Array(SIM.maxCells * 3);
+  private tipBase = new Float32Array(SIM.maxCells * 3);
+  private tipDeposit = new Uint8Array(SIM.maxCells * TIP.maxDeposit);
+  private tipDepositLen = new Uint8Array(SIM.maxCells);
+  private tipCounter = new Uint16Array(SIM.maxCells);
+  private tipSinceBranch = new Uint16Array(SIM.maxCells);
+  /** Timers: cycles per day, phase and duty. */
+  private timerCycles = new Uint8Array(SIM.maxCells);
+  private timerPhase = new Float32Array(SIM.maxCells);
+  private timerDuty = new Float32Array(SIM.maxCells);
   /** 1 while a Jet fired this tick (for the exhaust trail). */
   readonly firing = new Uint8Array(SIM.maxCells);
   /** 1 for cells of an organism with a living Root: they don't move at all. */
@@ -200,6 +273,12 @@ export class Sim {
   readonly bondRest = new Float32Array(SIM.maxBonds);
   bondCount = 0;
   private freeBonds: number[] = [];
+  /** Each cell's bonds: up to BOND_SLOTS bond ids per cell, and how many it has. */
+  private cellBonds = new Int32Array(SIM.maxCells * BOND_SLOTS);
+  private bondDeg = new Uint8Array(SIM.maxCells);
+  /** The cell's designed spot relative to its organism's origin, in world units (from hexQ/hexR). */
+  private restX = new Float32Array(SIM.maxCells);
+  private restY = new Float32Array(SIM.maxCells);
 
   // Organisms. orgCells 0 marks an empty slot.
   readonly owner = new Int32Array(SIM.maxOrganisms);
@@ -212,12 +291,15 @@ export class Sim {
   /** Generations since release (released organisms are generation 1), and mutations accumulated along the way. */
   readonly generation = new Int32Array(SIM.maxOrganisms);
   readonly mutations = new Int32Array(SIM.maxOrganisms);
+  /** Worm: segments the organism has (its plan and wiring follow this count). */
+  readonly orgSegments = new Int16Array(SIM.maxOrganisms).fill(1);
+  /** Growth tips: which tip advances next, and growth checks in a row with every active tip blocked. */
+  private orgTipTurn = new Uint16Array(SIM.maxOrganisms);
+  private orgTipStuck = new Uint8Array(SIM.maxOrganisms);
   /** Each organism's body rotation (from shape matching), the one before, and the tick it was measured. */
   private orgAngle = new Float32Array(SIM.maxOrganisms);
   private orgAnglePrev = new Float32Array(SIM.maxOrganisms);
   private orgAngleTick = new Int32Array(SIM.maxOrganisms).fill(-10);
-  /** Living cells per organism, rebuilt for the neuron pass. */
-  private orgMembers = new Map<number, number[]>();
   /** Spots (with their cell types) each organism has lost to eating or death, newest last: regrown first. */
   private lost = new Map<number, DesignCell[]>();
   /** Organisms splitting to reproduce (their new pieces are offspring and may mutate). */
@@ -232,23 +314,72 @@ export class Sim {
   // Scratch.
   private oldX = new Float32Array(SIM.maxCells);
   private oldY = new Float32Array(SIM.maxCells);
-  private uf = new Int32Array(SIM.maxCells);
+  /** Living cells grouped by organism (see groupOrganisms): orgList[orgStart[o] .. orgStart[o + 1]). */
+  private orgStart = new Int32Array(SIM.maxOrganisms + 1);
+  private orgList = new Int32Array(SIM.maxCells);
+  private orgFill = new Int32Array(SIM.maxOrganisms);
+  private contactFill = new Int32Array(0);
+  /** Per-organism flags and sums, reused every tick. */
+  private orgFlag = new Uint8Array(SIM.maxOrganisms);
+  private orgSum = new Float32Array(SIM.maxOrganisms * 7);
+  /** Connected-component labels for splitting (compared against splitStamp). */
+  private compStamp = new Int32Array(SIM.maxCells);
+  private splitStamp = 0;
+  /** Wired sources this tick, built once per tick on demand. */
+  private sourcesCache: Map<number, number> | null = null;
+  private sourcesTick = -1;
   private hashCols: number;
   private hashRows: number;
   private hashHead: Int32Array;
   private hashNext = new Int32Array(SIM.maxCells);
+  /** Contact solving: cells sorted by contact-grid bucket, with copies of their positions in that order. */
+  private sortedIds = new Int32Array(SIM.maxCells);
+  private sortedX = new Float32Array(SIM.maxCells);
+  private sortedY = new Float32Array(SIM.maxCells);
+  private sortedPinned = new Uint8Array(SIM.maxCells);
+  private contactStart: Int32Array;
+  private contactCols: number;
+  private contactRows: number;
   /** Spatial hash cell size: covers contacts (2r) and every touching distance. */
-  private bucket = CELL.radius * Math.max(2, MOUTH.touchDistance, SPIKE.touchDistance, DECOMPOSER.touchDistance);
-  private jetFrame = new Float32Array(SIM.maxCells);
+  private bucket = CELL.radius * Math.max(2, MOUTH.touchDistance, DECOMPOSER.touchDistance);
   /** 1 for cells drained by a Mouth this tick (for the render cue). */
   readonly drained = new Uint8Array(SIM.maxCells);
+
+  /** Snapshot buffer for nutrient flow. */
+  private waterScratch: Uint32Array;
+  /** Marine snow: per-tile drift of Dead cells toward deeper water (world units per second). */
+  private sinkX: Float32Array;
+  private sinkY: Float32Array;
 
   constructor(seed: number) {
     this.world = generateWorld(seed);
     this.rng = createRng(seed ^ 0x9e3779b9);
+    this.waterScratch = new Uint32Array(this.world.nutrient.length);
+    [this.sinkX, this.sinkY] = this.sinkField();
     this.hashCols = Math.ceil(this.worldWidth / this.bucket);
     this.hashRows = Math.ceil(this.worldHeight / this.bucket);
     this.hashHead = new Int32Array(this.hashCols * this.hashRows);
+    this.contactCols = Math.ceil(this.worldWidth / (2 * CELL.radius));
+    this.contactRows = Math.ceil(this.worldHeight / (2 * CELL.radius));
+    this.contactStart = new Int32Array(this.contactCols * this.contactRows + 1);
+  }
+
+  /** Direction down the depth slope at each tile, scaled to DEAD.sinkSpeed (zero on flat ground). */
+  private sinkField(): [Float32Array, Float32Array] {
+    const { width: w, height: h, depth } = this.world;
+    const sx = new Float32Array(w * h);
+    const sy = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const gx = depth[y * w + Math.min(w - 1, x + 1)] - depth[y * w + Math.max(0, x - 1)];
+        const gy = depth[Math.min(h - 1, y + 1) * w + x] - depth[Math.max(0, y - 1) * w + x];
+        const len = Math.hypot(gx, gy);
+        if (len < 1e-3) continue;
+        sx[y * w + x] = (gx / len) * DEAD.sinkSpeed;
+        sy[y * w + x] = (gy / len) * DEAD.sinkSpeed;
+      }
+    }
+    return [sx, sy];
   }
 
   tileAt(x: number, y: number): number {
@@ -267,6 +398,18 @@ export class Sim {
       this.genomeIds.set(key, id);
     }
     return id;
+  }
+
+  /** The plan an organism grows (a Worm's depends on its segment count). */
+  planOf(o: number): DesignCell[] {
+    const g = this.genomes[this.genomeId[o]];
+    return g.worm ? g.worm.plans[Math.min(g.worm.maxSegments, Math.max(1, this.orgSegments[o]))] : g.plan;
+  }
+
+  /** An organism's wiring by target plan slot (a Worm's depends on its segment count). */
+  wiresOf(o: number): Map<number, SlotWire[]> {
+    const g = this.genomes[this.genomeId[o]];
+    return g.worm ? g.worm.wires[Math.min(g.worm.maxSegments, Math.max(1, this.orgSegments[o]))] : g.wires;
   }
 
   /**
@@ -320,6 +463,7 @@ export class Sim {
     this.orgCells[org] = body.length;
     this.generation[org] = 1;
     this.mutations[org] = 0;
+    this.orgSegments[org] = 1;
 
     // Lay the body out in its hex shape around the release point, at a random orientation.
     const frame = this.rng() * Math.PI * 2;
@@ -352,10 +496,12 @@ export class Sim {
     this.sense(dt);
     this.updateNeurons(dt);
     this.fireJets(dt);
+    this.updateTips();
     this.killStarved();
     this.resolveSplits();
     if (this.tick % GROWTH.checkInterval === 0) this.growAndReproduce();
     this.decay();
+    if (this.tick % NUTRIENT_FLOW.intervalTicks === 0) stepNutrientFlow(this.world, this.waterScratch, this.rng);
     this.physics(dt);
     if (this.tick % Math.round(LINEAGE.statsIntervalSec * SIM.tickHz) === 0) this.lineageReport = this.lineages.update(this, this.tick);
   }
@@ -368,17 +514,25 @@ export class Sim {
     return METABOLISM.coldMultiplier + (METABOLISM.warmMultiplier - METABOLISM.coldMultiplier) * c;
   }
 
+  /**
+   * Leaves gain energy from light, Chemosynths from vents. Every living cell
+   * pays upkeep: scaled by temperature, by its type (support cells cost less),
+   * and by a colony discount for cells of bigger organisms.
+   */
   private updateEnergy(dt: number): void {
-    const { light, temperature } = this.world;
+    const { light, temperature, chem } = this.world;
+    const colonySpan = Math.max(1, COLONY.fullSize - 1);
     for (let i = 0; i < this.cellCount; i++) {
       if (!this.alive[i]) continue;
       this.age[i]++;
+      const t = this.type[i];
       const tile = this.tileAt(this.x[i], this.y[i]);
-      const gain = this.type[i] === CellType.Leaf ? LEAF.photosynthesis * light[tile] * dt : 0;
+      const gain =
+        t === CellType.Leaf ? LEAF.photosynthesis * light[tile] * dt : t === CellType.Chemosynth ? CHEMOSYNTH.rate * chem[tile] * dt : 0;
       if (gain > 0) this.lineages.creditLight(this.cellLineage[i], gain);
-      const scale = this.type[i] === CellType.Decomposer ? METABOLISM.decomposerUpkeep : 1;
-      const upkeep = METABOLISM.upkeep * scale * this.metabolism(temperature[tile]) * dt;
-      this.energy[i] = Math.min(energyCap(this.type[i]), this.energy[i] + gain - upkeep);
+      const colony = 1 - COLONY.maxDiscount * Math.min(1, (this.orgCells[this.organism[i]] - 1) / colonySpan);
+      const upkeep = METABOLISM.upkeep * TYPE_UPKEEP[t] * colony * this.metabolism(temperature[tile]) * dt;
+      this.energy[i] = Math.min(energyCap(t), this.energy[i] + gain - upkeep);
     }
   }
 
@@ -389,19 +543,62 @@ export class Sim {
    */
   private absorb(dt: number): void {
     const water = this.world.nutrient;
+    const cur = { x: 0, y: 0 };
+    const field = this.currents();
     for (let i = 0; i < this.cellCount; i++) {
       if (!this.alive[i]) continue;
       const t = this.type[i];
-      const rate = t === CellType.Leaf ? LEAF.absorbRate : t === CellType.Root ? ROOT.absorbRate : 0;
+      let rate = 0;
+      if (t === CellType.Leaf) rate = LEAF.absorbRate;
+      else if (t === CellType.Chemosynth) rate = CHEMOSYNTH.absorbRate;
+      else if (t === CellType.Root) rate = ROOT.absorbRate;
+      else if (t === CellType.Filter) {
+        // Filters feed on water moving through them: the current relative to the cell.
+        sampleCurrent(field, this.x[i], this.y[i], cur);
+        const flow = Math.min(1, Math.hypot(cur.x - this.vx[i], cur.y - this.vy[i]) / FILTER.fullSpeed);
+        const tile = this.tileAt(this.x[i], this.y[i]);
+        const e = FILTER.energyRate * flow * Math.min(1, water[tile] / FILTER.fullNutrient) * dt;
+        if (e > 0) {
+          this.energy[i] = Math.min(energyCap(t), this.energy[i] + e);
+          this.lineages.creditLight(this.cellLineage[i], e);
+        }
+        rate = FILTER.absorbRate * flow;
+      }
       if (rate === 0) continue;
       const amount = rate * dt;
       let units = Math.floor(amount) + (this.rng() < amount % 1 ? 1 : 0);
-      const tile = this.tileAt(this.x[i], this.y[i]);
+      if (units <= 0) continue;
+      // Roots reach the richest tile within their radius; others take from their own tile.
+      const tile = t === CellType.Root ? this.richestTile(this.x[i], this.y[i], ROOT.absorbRadius) : this.tileAt(this.x[i], this.y[i]);
       units = Math.min(units, water[tile], storedCap(t) - this.storedNutrient[i]);
       if (units <= 0) continue;
       water[tile] -= units;
       this.storedNutrient[i] += units;
     }
+  }
+
+  /** The tile with the most water nutrient within `radius` tiles of a point. */
+  private richestTile(px: number, py: number, radius: number): number {
+    const water = this.world.nutrient;
+    const tx = Math.min(WORLD.width - 1, Math.max(0, Math.floor(px / WORLD.tileSize)));
+    const ty = Math.min(WORLD.height - 1, Math.max(0, Math.floor(py / WORLD.tileSize)));
+    let best = ty * WORLD.width + tx;
+    for (let dy = -radius; dy <= radius; dy++) {
+      const y = ty + dy;
+      if (y < 0 || y >= WORLD.height) continue;
+      for (let dx = -radius; dx <= radius; dx++) {
+        const x = tx + dx;
+        if (x < 0 || x >= WORLD.width || dx * dx + dy * dy > radius * radius) continue;
+        const t = y * WORLD.width + x;
+        if (water[t] > water[best]) best = t;
+      }
+    }
+    return best;
+  }
+
+  private currents(): CurrentField {
+    const w = this.world;
+    return { dir: w.currentDir, strength: w.currentStrength, vx: w.currentVx, vy: w.currentVy };
   }
 
   /**
@@ -429,6 +626,10 @@ export class Sim {
         let f = k * (this.energy[other] - keep);
         // Fat never gives away its own reserve (a new Fat cell would otherwise starve on the spot).
         f = f > 0 ? Math.min(f, FAT.maxEnergy - this.energy[fat]) : -Math.min(-f, Math.max(0, this.energy[fat] - FAT.reserve));
+        // Below its reserve, Fat fills up from its neighbor like any cell, so it never starves for good.
+        if (this.energy[fat] < FAT.reserve && this.energy[other] > this.energy[fat]) {
+          f = Math.min(k * (this.energy[other] - this.energy[fat]), FAT.reserve - this.energy[fat]);
+        }
         this.energy[other] -= f;
         this.energy[fat] += f;
       } else {
@@ -454,7 +655,7 @@ export class Sim {
 
   /** Cells with a facing direction: Jets and sensors face outward from the cell they're attached to. */
   private faces(i: number): boolean {
-    return this.jetPush[i] >= 0 && (this.type[i] === CellType.Jet || isSensorType(this.type[i]));
+    return this.type[i] === CellType.Tip || (this.jetPush[i] >= 0 && (this.type[i] === CellType.Jet || isSensorType(this.type[i])));
   }
 
   /**
@@ -463,27 +664,24 @@ export class Sim {
    * Without a bond to measure from, it keeps its last direction.
    */
   private updateFacing(): void {
-    const n = this.cellCount;
-    const frame = this.jetFrame;
-    frame.fill(NaN, 0, n);
-    for (let b = 0; b < this.bondCount; b++) {
-      const a = this.bondA[b];
-      if (a < 0) continue;
-      const c = this.bondB[b];
-      for (const [i, j] of [
-        [a, c],
-        [c, a],
-      ]) {
-        if (!this.faces(i) || !Number.isNaN(frame[i])) continue;
-        const [lx, ly] = hexToLocal(this.hexQ[j] - this.hexQ[i], this.hexR[j] - this.hexR[i]);
-        frame[i] = Math.atan2(this.y[j] - this.y[i], this.x[j] - this.x[i]) - Math.atan2(ly, lx);
+    for (let i = 0; i < this.cellCount; i++) {
+      if (!this.alive[i] || !this.faces(i) || this.bondDeg[i] === 0) continue;
+      const j = this.bondOther(this.cellBonds[i * BOND_SLOTS], i);
+      const frame = Math.atan2(this.y[j] - this.y[i], this.x[j] - this.x[i]) - hexAngle(this.hexQ[j] - this.hexQ[i], this.hexR[j] - this.hexR[i]);
+      if (this.type[i] === CellType.Tip) {
+        // A tip's angle is the way it grows.
+        const [dq, dr] = HEX_DIRS[this.tipDir[i]];
+        this.angle[i] = frame + hexAngle(dq, dr);
+        continue;
       }
+      const [dq, dr] = HEX_DIRS[this.jetPush[i]];
+      this.angle[i] = frame + hexAngle(dq, dr) + Math.PI;
     }
-    for (let i = 0; i < n; i++) {
-      if (!this.alive[i] || !this.faces(i) || Number.isNaN(frame[i])) continue;
-      const [px, py] = hexToLocal(...HEX_DIRS[this.jetPush[i]]);
-      this.angle[i] = frame[i] + Math.atan2(py, px) + Math.PI;
-    }
+  }
+
+  /** The cell at the other end of bond b from cell i. */
+  private bondOther(b: number, i: number): number {
+    return this.bondA[b] === i ? this.bondB[b] : this.bondA[b];
   }
 
   /**
@@ -499,8 +697,9 @@ export class Sim {
     const tempRange = TEMPERATURE.center - TEMPERATURE.edge;
     const smooth = 1 - Math.exp(-dt / SENSOR.changeWindowSec);
     const cone = Math.cos((SENSOR.coneHalfAngle * Math.PI) / 180);
+    const day = dayPhase(this.world.time);
     for (let i = 0; i < this.cellCount; i++) {
-      if (!this.alive[i] || !isSensorType(this.type[i])) continue;
+      if (!this.alive[i] || !(isSensorType(this.type[i]) || this.type[i] === CellType.Timer)) continue;
       const fx = Math.cos(this.angle[i]);
       const fy = Math.sin(this.angle[i]);
       const tile = this.tileAt(this.x[i] + fx * SENSOR.readDistance, this.y[i] + fy * SENSOR.readDistance);
@@ -526,7 +725,9 @@ export class Sim {
           let count = 0;
           const only = this.proxFilter[i];
           this.contacts(i, SENSOR.proximityRange, (j) => {
-            if (!this.alive[j] || this.organism[j] === this.organism[i] || (only !== 0 && this.type[j] !== only)) return;
+            if (only === CellType.Dead) {
+              if (this.type[j] !== CellType.Dead) return;
+            } else if (!this.alive[j] || this.organism[j] === this.organism[i] || (only !== 0 && this.type[j] !== only)) return;
             const dx = this.x[j] - this.x[i];
             const dy = this.y[j] - this.y[i];
             const d = Math.hypot(dx, dy) || 1;
@@ -535,6 +736,9 @@ export class Sim {
           level = count / SENSOR.proximityFull;
           break;
         }
+        case CellType.Timer:
+          level = timerLevel(day, this.timerCycles[i], this.timerPhase[i], this.timerDuty[i]);
+          break;
       }
       level = Math.min(1, Math.max(0, level));
       // A new sensor starts with no trend.
@@ -545,11 +749,14 @@ export class Sim {
     }
   }
 
-  /** Wired sources (sensors and neurons) by (organism, plan slot). */
+  /** Wired sources (sensors and neurons) by (organism, plan slot). Built once per tick. */
   private wiredSources(): Map<number, number> {
-    const map = new Map<number, number>();
+    if (this.sourcesCache && this.sourcesTick === this.tick) return this.sourcesCache;
+    const map = (this.sourcesCache ??= new Map<number, number>());
+    map.clear();
+    this.sourcesTick = this.tick;
     for (let j = 0; j < this.cellCount; j++) {
-      if (this.alive[j] && this.planSlot[j] >= 0 && (isSensorType(this.type[j]) || this.type[j] === CellType.Neuron)) {
+      if (this.alive[j] && this.planSlot[j] >= 0 && (isSensorType(this.type[j]) || this.type[j] === CellType.Neuron || this.type[j] === CellType.Timer)) {
         map.set(this.organism[j] * 65536 + this.planSlot[j], j);
       }
     }
@@ -576,21 +783,25 @@ export class Sim {
     const prev = this.neuronPrev;
     prev.set(this.neuronOut.subarray(0, n));
     const sources = this.wiredSources();
-    const body = this.bodyReadings(dt);
+    this.groupOrganisms();
+    this.bodyReadings(dt);
+    const R = this.orgSum;
     const K = NEURON_INPUT_KEYS.length;
     for (let i = 0; i < n; i++) {
       if (!this.alive[i] || this.type[i] !== CellType.Neuron) continue;
       const org = this.organism[i];
       let sum = this.neuronBias[i];
-      for (const w of this.genomes[this.genomeId[org]].wires.get(this.planSlot[i]) ?? []) {
+      for (const w of this.wiresOf(org).get(this.planSlot[i]) ?? []) {
         const src = sources.get(org * 65536 + w.source);
         if (src !== undefined) sum += w.weight * this.wireInput(src, w.change, prev);
       }
-      // Internal inputs.
-      const b = body.get(org)!;
-      const noise = this.driftNoise(i, dt);
-      const values = [b.forward, b.sideways, b.turning, this.eatenNear(i, dt), b.energy, b.nutrient, b.size, noise];
-      for (let k = 0; k < K; k++) sum += this.neuronInputs[i * K + k] * values[k];
+      // Internal inputs, in NEURON_INPUT_KEYS order: forward, sideways, turning, eaten, energy, nutrient, size, noise.
+      const base = i * K;
+      const o7 = org * 7;
+      sum += this.neuronInputs[base] * R[o7] + this.neuronInputs[base + 1] * R[o7 + 1] + this.neuronInputs[base + 2] * R[o7 + 2];
+      sum += this.neuronInputs[base + 3] * this.eatenNear(i, dt);
+      sum += this.neuronInputs[base + 4] * R[o7 + 3] + this.neuronInputs[base + 5] * R[o7 + 4] + this.neuronInputs[base + 6] * R[o7 + 5];
+      sum += this.neuronInputs[base + 7] * this.driftNoise(i, dt);
       const target = Math.tanh(sum);
       this.neuronOut[i] = prev[i] + (target - prev[i]) * (1 - Math.exp(-this.neuronSpeed[i] * NEURON.maxRate * dt));
     }
@@ -609,7 +820,8 @@ export class Sim {
     const org = this.organism[i];
     const whole = this.neuronEatenRange[i] >= NEURON_INPUTS.eatenRangeMax;
     let drained = 0;
-    for (const j of this.orgMembers.get(org) ?? []) {
+    for (let m = this.orgStart[org]; m < this.orgStart[org + 1]; m++) {
+      const j = this.orgList[m];
       if (this.drainTaken[j] <= 0) continue;
       if (whole || hexDistance(this.hexQ[i], this.hexR[i], this.hexQ[j], this.hexR[j]) <= this.neuronEatenRange[i]) drained += this.drainTaken[j];
     }
@@ -617,53 +829,55 @@ export class Sim {
   }
 
   /**
-   * Organism-level readings for neurons: velocity in the body frame (forward is
-   * the way its Jets push overall, or +x of its layout), turning speed, stored
-   * energy and nutrient as fractions of capacity, and size as a fraction of max cells.
+   * Organism-level readings for neurons, written into orgSum (7 per organism):
+   * velocity in the body frame (forward is the way its Jets push overall, or
+   * +x of its layout), turning speed, stored energy and nutrient as fractions
+   * of capacity, and size as a fraction of max cells. Only organisms with a
+   * Neuron are measured. Needs groupOrganisms().
    */
-  private bodyReadings(dt: number): Map<number, { forward: number; sideways: number; turning: number; energy: number; nutrient: number; size: number }> {
-    const sums = new Map<number, { n: number; vx: number; vy: number; e: number; ec: number; s: number; sc: number }>();
-    this.orgMembers.clear();
-    for (let i = 0; i < this.cellCount; i++) {
-      if (!this.alive[i]) continue;
-      const o = this.organism[i];
-      let m = sums.get(o);
-      if (!m) sums.set(o, (m = { n: 0, vx: 0, vy: 0, e: 0, ec: 0, s: 0, sc: 0 }));
-      m.n++;
-      m.vx += this.vx[i];
-      m.vy += this.vy[i];
-      m.e += this.energy[i];
-      m.ec += energyCap(this.type[i]);
-      m.s += this.storedNutrient[i];
-      m.sc += storedCap(this.type[i]);
-      let list = this.orgMembers.get(o);
-      if (!list) this.orgMembers.set(o, (list = []));
-      list.push(i);
-    }
-    const out = new Map<number, { forward: number; sideways: number; turning: number; energy: number; nutrient: number; size: number }>();
+  private bodyReadings(dt: number): void {
+    const flag = this.orgFlag;
+    flag.fill(0, 0, this.orgCount);
+    for (let i = 0; i < this.cellCount; i++) if (this.alive[i] && this.type[i] === CellType.Neuron) flag[this.organism[i]] = 1;
     const clamp1 = (v: number) => Math.min(1, Math.max(-1, v));
-    for (const [o, m] of sums) {
+    const R = this.orgSum;
+    for (let o = 0; o < this.orgCount; o++) {
+      if (!flag[o]) continue;
+      let vx = 0;
+      let vy = 0;
+      let e = 0;
+      let ec = 0;
+      let st = 0;
+      let sc = 0;
+      const a = this.orgStart[o];
+      const b = this.orgStart[o + 1];
+      for (let m = a; m < b; m++) {
+        const i = this.orgList[m];
+        vx += this.vx[i];
+        vy += this.vy[i];
+        e += this.energy[i];
+        ec += energyCap(this.type[i]);
+        st += this.storedNutrient[i];
+        sc += storedCap(this.type[i]);
+      }
+      const count = b - a;
       const g = this.genomes[this.genomeId[o]];
       const heading = this.orgAngle[o] + Math.atan2(g.forward[1], g.forward[0]);
-      const vx = m.vx / m.n;
-      const vy = m.vy / m.n;
-      const fwd = vx * Math.cos(heading) + vy * Math.sin(heading);
-      const side = -vx * Math.sin(heading) + vy * Math.cos(heading);
+      vx /= count;
+      vy /= count;
       let turn = 0;
       if (this.orgAngleTick[o] === this.tick - 1) {
         const dA = this.orgAngle[o] - this.orgAnglePrev[o];
         turn = Math.atan2(Math.sin(dA), Math.cos(dA)) / dt;
       }
-      out.set(o, {
-        forward: clamp1(fwd / NEURON_INPUTS.speedFull),
-        sideways: clamp1(side / NEURON_INPUTS.speedFull),
-        turning: clamp1(turn / NEURON_INPUTS.turnFull),
-        energy: m.e / m.ec,
-        nutrient: m.sc > 0 ? m.s / m.sc : 0,
-        size: Math.min(1, m.n / g.maxCells),
-      });
+      const o7 = o * 7;
+      R[o7] = clamp1((vx * Math.cos(heading) + vy * Math.sin(heading)) / NEURON_INPUTS.speedFull);
+      R[o7 + 1] = clamp1((-vx * Math.sin(heading) + vy * Math.cos(heading)) / NEURON_INPUTS.speedFull);
+      R[o7 + 2] = clamp1(turn / NEURON_INPUTS.turnFull);
+      R[o7 + 3] = e / ec;
+      R[o7 + 4] = sc > 0 ? st / sc : 0;
+      R[o7 + 5] = Math.min(1, count / g.maxCells);
     }
-    return out;
   }
 
   /**
@@ -676,20 +890,23 @@ export class Sim {
   private fireJets(dt: number): void {
     const n = this.cellCount;
     let sources: Map<number, number> | null = null;
-    // Hex spots occupied by living cells, per organism (only needed when there are Jets).
+    // Hex spots occupied by living cells of organisms that have Jets.
     let occupied: Set<number> | null = null;
     const spot = (org: number, q: number, r: number) => org * 4194304 + hexKey(q, r);
+    this.firing.fill(0, 0, n);
     for (let i = 0; i < n; i++) {
-      this.firing[i] = 0;
       if (!this.alive[i] || this.type[i] !== CellType.Jet || this.jetPush[i] < 0) continue;
       if (!occupied) {
         occupied = new Set();
-        for (let j = 0; j < n; j++) if (this.alive[j]) occupied.add(spot(this.organism[j], this.hexQ[j], this.hexR[j]));
+        const flag = this.orgFlag;
+        flag.fill(0, 0, this.orgCount);
+        for (let j = 0; j < n; j++) if (this.alive[j] && this.type[j] === CellType.Jet) flag[this.organism[j]] = 1;
+        for (let j = 0; j < n; j++) if (this.alive[j] && flag[this.organism[j]]) occupied.add(spot(this.organism[j], this.hexQ[j], this.hexR[j]));
       }
       const [pq, pr] = HEX_DIRS[this.jetPush[i]];
       if (occupied.has(spot(this.organism[i], this.hexQ[i] - pq, this.hexR[i] - pr))) continue;
       let strength = this.jetStrength[i];
-      const wires = this.genomes[this.genomeId[this.organism[i]]].wires.get(this.planSlot[i]);
+      const wires = this.wiresOf(this.organism[i]).get(this.planSlot[i]);
       if (wires) {
         sources ??= this.wiredSources();
         for (const w of wires) {
@@ -708,13 +925,31 @@ export class Sim {
     }
   }
 
+  /** Growth tips: each signal = its base + sum of (weight × wired input) on that channel, clamped to -1..1. */
+  private updateTips(): void {
+    let sources: Map<number, number> | null = null;
+    for (let i = 0; i < this.cellCount; i++) {
+      if (!this.alive[i] || this.type[i] !== CellType.Tip) continue;
+      const sig = [this.tipBase[i * 3], this.tipBase[i * 3 + 1], this.tipBase[i * 3 + 2]];
+      const wires = this.planSlot[i] >= 0 ? this.wiresOf(this.organism[i]).get(this.planSlot[i]) : undefined;
+      if (wires) {
+        sources ??= this.wiredSources();
+        for (const w of wires) {
+          const src = sources.get(this.organism[i] * 65536 + w.source);
+          if (src !== undefined) sig[w.channel] += w.weight * this.wireInput(src, w.change, this.neuronOut);
+        }
+      }
+      for (let c = 0; c < 3; c++) this.tipSignal[i * 3 + c] = Math.min(1, Math.max(-1, sig[c]));
+    }
+  }
+
   /** Living cell-to-cell wires (source, target, weight), for drawing. */
   wireList(): Float32Array {
     const out: number[] = [];
     const sources = this.wiredSources();
     for (let i = 0; i < this.cellCount; i++) {
       if (!this.alive[i] || this.planSlot[i] < 0) continue;
-      const wires = this.genomes[this.genomeId[this.organism[i]]].wires.get(this.planSlot[i]);
+      const wires = this.wiresOf(this.organism[i]).get(this.planSlot[i]);
       for (const w of wires ?? []) {
         const src = sources.get(this.organism[i] * 65536 + w.source);
         if (src !== undefined) out.push(src, i, w.weight);
@@ -744,9 +979,7 @@ export class Sim {
 
   /** Breaks all of a cell's bonds and removes it from its organism. */
   private detach(i: number): void {
-    for (let b = 0; b < this.bondCount; b++) {
-      if (this.bondA[b] === i || this.bondB[b] === i) this.freeBond(b);
-    }
+    while (this.bondDeg[i] > 0) this.freeBond(this.cellBonds[i * BOND_SLOTS]);
     const org = this.organism[i];
     this.organism[i] = -1;
     this.orgCells[org]--;
@@ -770,7 +1003,9 @@ export class Sim {
       strength: this.jetStrength[i],
       push: this.jetPush[i],
       index: this.planSlot[i] >= 0 ? this.planSlot[i] : undefined,
-      filter: this.proxFilter[i] ? (TYPE_STYLE[this.proxFilter[i]] as CellKind) : undefined,
+      filter: this.proxFilter[i] ? (TYPE_STYLE[this.proxFilter[i]] as ProximityFilter) : undefined,
+      ...(this.type[i] === CellType.Timer ? { cycles: this.timerCycles[i], phase: this.timerPhase[i], duty: this.timerDuty[i] } : {}),
+      ...(this.type[i] === CellType.Tip ? this.tipSettings(i) : {}),
       ...(this.type[i] === CellType.Neuron
         ? {
             bias: this.neuronBias[i],
@@ -805,7 +1040,6 @@ export class Sim {
       if (!this.alive[i]) continue;
       const t = this.type[i];
       if (t === CellType.Mouth) this.contacts(i, MOUTH.touchDistance, (j) => this.mouthBite(i, j, dt));
-      else if (t === CellType.Spike) this.contacts(i, SPIKE.touchDistance, (j) => this.spikeDrain(i, j, dt));
       else if (t === CellType.Decomposer) this.contacts(i, DECOMPOSER.touchDistance, (j) => this.decompose(i, j, dt));
     }
   }
@@ -833,7 +1067,18 @@ export class Sim {
   private mouthBite(i: number, j: number, dt: number): boolean {
     if (!this.alive[i]) return false;
     if (!this.alive[j] || this.organism[j] === this.organism[i]) return true;
-    const take = Math.max(0, Math.min(this.energy[j], MOUTH.drainRate * dt));
+    if (this.type[j] === CellType.Spike) {
+      // Biting a Spike hurts: the Mouth loses more than it gains. A Mouth that
+      // starves soon after counts as killed by the Spike's lineage.
+      const hurt = SPIKE.retaliation * dt;
+      this.energy[i] -= hurt;
+      this.drainTaken[i] += hurt;
+      this.drained[i] = 1;
+      this.spikedBy[i] = this.cellLineage[j];
+      this.spikedAt[i] = this.tick;
+    }
+    const rate = MOUTH.drainRate * (this.type[j] === CellType.Shell ? SHELL.mouthDrainFactor : 1);
+    const take = Math.max(0, Math.min(this.energy[j], rate * dt));
     this.energy[j] -= take;
     this.drainTaken[j] += take;
     this.energy[i] = Math.min(energyCap(this.type[i]), this.energy[i] + take * MOUTH.efficiency);
@@ -841,16 +1086,6 @@ export class Sim {
     this.drained[j] = 1;
     if (this.energy[j] <= 0) this.eat(i, j);
     return true;
-  }
-
-  private spikeDrain(i: number, j: number, dt: number): void {
-    if (!this.alive[j] || this.organism[j] === this.organism[i]) return;
-    const take = Math.max(0, Math.min(this.energy[j], SPIKE.drainRate * dt));
-    this.energy[j] -= take;
-    this.drainTaken[j] += take;
-    this.drained[j] = 1;
-    this.spikedBy[j] = this.cellLineage[i];
-    this.spikedAt[j] = this.tick;
   }
 
   private decompose(i: number, j: number, dt: number): void {
@@ -896,7 +1131,14 @@ export class Sim {
 
   /** Each disconnected piece of an organism becomes its own organism with the same genome. */
   private resolveSplits(): void {
-    for (const org of this.dirtyOrgs) if (this.orgCells[org] > 0) this.splitComponents(org, this.reproducing.has(org));
+    if (this.dirtyOrgs.size > 0) {
+      const members = new Map<number, number[]>();
+      for (const org of this.dirtyOrgs) if (this.orgCells[org] > 0) members.set(org, []);
+      if (members.size > 0) {
+        for (let i = 0; i < this.cellCount; i++) if (this.organism[i] >= 0) members.get(this.organism[i])?.push(i);
+        for (const [org, cells] of members) this.splitComponents(org, cells, this.reproducing.has(org));
+      }
+    }
     this.dirtyOrgs.clear();
     this.reproducing.clear();
   }
@@ -907,44 +1149,35 @@ export class Sim {
    * generation, with a possibly mutated copy of the genome. Pieces left by a
    * death keep the genome unchanged.
    */
-  private splitComponents(org: number, offspring = false): void {
-    const uf = this.uf;
-    const find = (i: number): number => {
-      while (uf[i] !== i) {
-        uf[i] = uf[uf[i]];
-        i = uf[i];
+  private splitComponents(org: number, members: number[], offspring = false): void {
+    // Connected pieces over the bond graph (breadth-first from each unlabeled cell).
+    const stamp = ++this.splitStamp;
+    const groups: number[][] = [];
+    for (const start of members) {
+      if (this.compStamp[start] === stamp) continue;
+      this.compStamp[start] = stamp;
+      const piece = [start];
+      for (let h = 0; h < piece.length; h++) {
+        const c = piece[h];
+        for (let k = 0; k < this.bondDeg[c]; k++) {
+          const nb = this.bondOther(this.cellBonds[c * BOND_SLOTS + k], c);
+          if (this.organism[nb] !== org || this.compStamp[nb] === stamp) continue;
+          this.compStamp[nb] = stamp;
+          piece.push(nb);
+        }
       }
-      return i;
-    };
-    const members: number[] = [];
-    for (let i = 0; i < this.cellCount; i++) {
-      if (this.organism[i] === org) {
-        uf[i] = i;
-        members.push(i);
-      }
+      groups.push(piece);
     }
-    for (let b = 0; b < this.bondCount; b++) {
-      const a = this.bondA[b];
-      if (a < 0 || this.organism[a] !== org) continue;
-      const ra = find(a);
-      const rb = find(this.bondB[b]);
-      if (ra !== rb) uf[ra] = rb;
-    }
-    const groups = new Map<number, number[]>();
-    for (const i of members) {
-      const root = find(i);
-      let g = groups.get(root);
-      if (!g) groups.set(root, (g = []));
-      g.push(i);
-    }
-    if (groups.size <= 1) return;
-    const parts = [...groups.values()].sort((p, q) => q.length - p.length);
+    if (groups.length <= 1) return;
+    const parts = groups.sort((p, q) => q.length - p.length);
     for (let p = 1; p < parts.length; p++) {
       const child = this.allocOrg();
       if (child < 0) return;
       this.owner[child] = this.owner[org];
       this.lineage[child] = this.lineage[org];
       this.inherit(org, child, offspring);
+      const cg = this.genomes[this.genomeId[child]];
+      this.orgSegments[child] = Math.min(this.orgSegments[org], cg.worm?.maxSegments ?? 1);
       // Pieces that came apart keep the memory of lost spots near them.
       if (!offspring && this.lost.has(org)) this.lost.set(child, this.lost.get(org)!.map((l) => ({ ...l })));
       for (const i of parts[p]) this.organism[i] = child;
@@ -988,15 +1221,16 @@ export class Sim {
     }
   }
 
-  /** Groups living cells by organism (counting sort) for the growth pass. */
-  private cellsByOrganism(): { start: Int32Array; list: Int32Array } {
-    const start = new Int32Array(this.orgCount + 1);
+  /** Groups living cells by organism (counting sort) into orgStart / orgList. */
+  private groupOrganisms(): void {
+    const start = this.orgStart;
+    const n = this.orgCount;
+    start.fill(0, 0, n + 1);
     for (let i = 0; i < this.cellCount; i++) if (this.alive[i] && this.organism[i] >= 0) start[this.organism[i] + 1]++;
-    for (let o = 0; o < this.orgCount; o++) start[o + 1] += start[o];
-    const fill = start.slice(0, this.orgCount);
-    const list = new Int32Array(start[this.orgCount]);
-    for (let i = 0; i < this.cellCount; i++) if (this.alive[i] && this.organism[i] >= 0) list[fill[this.organism[i]]++] = i;
-    return { start, list };
+    for (let o = 0; o < n; o++) start[o + 1] += start[o];
+    const fill = this.orgFill;
+    fill.set(start.subarray(0, n));
+    for (let i = 0; i < this.cellCount; i++) if (this.alive[i] && this.organism[i] >= 0) this.orgList[fill[this.organism[i]]++] = i;
   }
 
   /**
@@ -1004,7 +1238,9 @@ export class Sim {
    * reproduce when they have enough stored energy and nutrient.
    */
   private growAndReproduce(): void {
-    const { start, list } = this.cellsByOrganism();
+    this.groupOrganisms();
+    const start = this.orgStart;
+    const list = this.orgList;
     const orgs = this.orgCount;
     for (let o = 0; o < orgs; o++) {
       const count = start[o + 1] - start[o];
@@ -1019,9 +1255,45 @@ export class Sim {
     this.resolveSplits();
   }
 
-  /** Whether a cell can pay for one new cell (and keep some energy to live on). */
-  private canPay(i: number, g: Genome): boolean {
-    return this.energy[i] >= g.design.growEnergy + GROWTH.keepEnergy && this.storedNutrient[i] >= g.design.growNutrient;
+  /** Energy a cell can give toward growth: all but what it keeps to live on (Fat keeps its reserve). */
+  private spareEnergy(i: number): number {
+    const keep = this.type[i] === CellType.Fat ? Math.max(FAT.reserve, GROWTH.keepEnergy) : GROWTH.keepEnergy;
+    return Math.max(0, this.energy[i] - keep);
+  }
+
+  /** Whether the organism's cells together can pay this much energy and stored nutrient. */
+  private poolCanPay(cells: number[], energy: number, nutrient: number): boolean {
+    let e = 0;
+    let n = 0;
+    for (const c of cells) {
+      e += this.spareEnergy(c);
+      n += this.storedNutrient[c];
+    }
+    return e >= energy && n >= nutrient;
+  }
+
+  /**
+   * Takes energy and stored nutrient from the organism's cells: `first` pays
+   * first, then the cells with the most to spare. Nutrient moves in whole
+   * units. Call poolCanPay first.
+   */
+  private poolPay(cells: number[], first: number, energy: number, nutrient: number): void {
+    if (energy > 0) {
+      const order = cells.filter((c) => c !== first).sort((a, b) => this.spareEnergy(b) - this.spareEnergy(a));
+      for (const c of [first, ...order]) {
+        const take = Math.min(energy, this.spareEnergy(c));
+        this.energy[c] -= take;
+        if ((energy -= take) <= 1e-9) break;
+      }
+    }
+    if (nutrient > 0) {
+      const order = cells.filter((c) => c !== first).sort((a, b) => this.storedNutrient[b] - this.storedNutrient[a]);
+      for (const c of [first, ...order]) {
+        const take = Math.min(nutrient, this.storedNutrient[c]);
+        this.storedNutrient[c] -= take;
+        if ((nutrient -= take) === 0) break;
+      }
+    }
   }
 
   /** Orientation of the organism's hex frame at cell i, measured from a neighbor when possible. */
@@ -1066,16 +1338,34 @@ export class Sim {
     return true;
   }
 
+  /**
+   * Adds one cell (or a Worm segment). Order: free plan slots touching the
+   * body (the earliest, or with growth tips the one nearest an active tip),
+   * then lost spots, then a Worm's next segment or a Blob's tips and random
+   * edge spots. With growth tips, nothing grows while every tip is inactive.
+   */
   private grow(o: number, g: Genome, cells: number[], occ: Map<number, number>): void {
-    // Form, Pattern, and a Blob's seed body: the earliest free plan slot touching the body.
+    const tips = cells.filter((i) => this.type[i] === CellType.Tip);
+    const active = tips.filter((i) => this.tipSignal[i * 3] > TIP.growThreshold);
+    if (tips.length > 0 && active.length === 0) return;
     let slot: DesignCell | null = null;
     let parents: number[] = [];
-    for (const s of g.plan) {
+    let best = Infinity;
+    for (const s of this.planOf(o)) {
       if (occ.has(hexKey(s.q, s.r))) continue;
-      parents = this.adjacent(s.q, s.r, occ);
-      if (parents.length) {
+      const adj = this.adjacent(s.q, s.r, occ);
+      if (!adj.length) continue;
+      // Without tips the earliest slot wins; with tips, the one nearest an active tip.
+      let score = 0;
+      if (active.length) {
+        score = Infinity;
+        for (const t of active) score = Math.min(score, hexDistance(s.q, s.r, this.hexQ[t], this.hexR[t]));
+      }
+      if (score < best) {
+        best = score;
         slot = s;
-        break;
+        parents = adj;
+        if (!active.length) break;
       }
     }
     // Then spots it lost (eaten or died), newest first, as they were.
@@ -1091,8 +1381,21 @@ export class Sim {
         if (parents.length) slot = s;
       }
     }
-    // Blob: then random free spots on its edge, with types from the cell mix.
+    if (!slot && g.worm) {
+      this.insertSegment(o, g, cells, occ);
+      return;
+    }
     if (!slot && g.design.growth === 'blob') {
+      if (active.length) {
+        if (this.advanceTips(o, g, cells, occ, active)) {
+          this.orgTipStuck[o] = 0;
+          return;
+        }
+        // Every active tip is blocked: after a while, grow one random edge cell instead.
+        if (++this.orgTipStuck[o] < TIP.stuckChecks) return;
+        this.orgTipStuck[o] = 0;
+      }
+      // Random free spots on its edge, with types from the cell mix.
       for (let attempt = 0; attempt < 6 && !slot; attempt++) {
         const c = cells[Math.floor(this.rng() * cells.length)];
         const [dq, dr] = HEX_DIRS[Math.floor(this.rng() * 6)];
@@ -1105,19 +1408,172 @@ export class Sim {
         parents = [c, ...this.adjacent(q, r, occ).filter((p) => p !== c)];
       }
     }
-    if (!slot) return;
-    const parent = parents.find((p) => this.canPay(p, g));
-    if (parent === undefined) return;
+    if (!slot || !this.poolCanPay(cells, g.design.growEnergy, g.design.growNutrient)) return;
+    const parent = parents[0];
     const frame = this.frameAngle(parent, occ);
     const [px, py] = this.placeNear(parent, slot.q, slot.r, frame);
     if (!this.spotFree(px, py)) return;
-    const id = this.addCell(parent, g, slot, px, py, frame, o);
+    const id = this.addCell(cells, parent, g, slot, px, py, frame, o);
     if (id < 0) return;
     // Bond to every neighbor in the layout: filled shapes hold, chains flex.
     for (const n of this.adjacent(slot.q, slot.r, occ)) this.addBond(n, id, 2 * CELL.radius);
     occ.set(hexKey(slot.q, slot.r), id);
+    cells.push(id);
     const list = this.lost.get(o);
     if (list) this.lost.set(o, list.filter((l) => l.q !== slot!.q || l.r !== slot!.r));
+  }
+
+  /** A tip's settings as a design cell (for regrowing it, or for a tip it branches off). */
+  private tipSettings(i: number): Partial<DesignCell> {
+    const deposit: CellKind[] = [];
+    for (let n = 0; n < this.tipDepositLen[i]; n++) deposit.push(TYPE_STYLE[this.tipDeposit[i * TIP.maxDeposit + n]] as CellKind);
+    return { deposit, grow: this.tipBase[i * 3], turn: this.tipBase[i * 3 + 1], branch: this.tipBase[i * 3 + 2] };
+  }
+
+  /**
+   * Blob growth through tips: the next active tip (round-robin) turns if its
+   * Turn signal says so, grows the spot it faces and moves onto it, leaving the
+   * next cell type of its deposit cycle behind. With a strong Branch signal it
+   * also starts a new tip at its side. False if every active tip is blocked.
+   */
+  private advanceTips(o: number, g: Genome, cells: number[], occ: Map<number, number>, active: number[]): boolean {
+    const start = this.orgTipTurn[o] % active.length;
+    for (let k = 0; k < active.length; k++) {
+      const tip = active[(start + k) % active.length];
+      if (this.advanceTip(o, g, cells, occ, tip)) {
+        this.orgTipTurn[o] = (start + k + 1) % active.length;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private advanceTip(o: number, g: Genome, cells: number[], occ: Map<number, number>, tip: number): boolean {
+    const { growEnergy, growNutrient } = g.design;
+    if (cells.length >= g.maxCells || !this.poolCanPay(cells, growEnergy, growNutrient)) return false;
+    const turn = this.tipSignal[tip * 3 + 1];
+    // HEX_DIRS run counterclockwise on screen, so +1 turns left and +5 (−1) turns right.
+    if (turn > TIP.turnThreshold) this.tipDir[tip] = (this.tipDir[tip] + 5) % 6;
+    else if (turn < -TIP.turnThreshold) this.tipDir[tip] = (this.tipDir[tip] + 1) % 6;
+    const dir = this.tipDir[tip];
+    const oq = this.hexQ[tip];
+    const or = this.hexR[tip];
+    const fq = oq + HEX_DIRS[dir][0];
+    const fr = or + HEX_DIRS[dir][1];
+    if (occ.has(hexKey(fq, fr))) return false;
+    const frame = this.frameAngle(tip, occ);
+    const [fx, fy] = this.placeNear(tip, fq, fr, frame);
+    if (!this.spotFree(fx, fy)) return false;
+    const ox = this.x[tip];
+    const oy = this.y[tip];
+    // Move the tip forward (its bonds are rebuilt below; nothing is lost).
+    while (this.bondDeg[tip] > 0) this.freeBond(this.cellBonds[tip * BOND_SLOTS]);
+    occ.delete(hexKey(oq, or));
+    this.setHex(tip, fq, fr);
+    this.x[tip] = fx;
+    this.y[tip] = fy;
+    occ.set(hexKey(fq, fr), tip);
+    // Leave the next deposit type behind, attached to the body behind it.
+    const len = Math.max(1, this.tipDepositLen[tip]);
+    const kind = TYPE_STYLE[this.tipDeposit[tip * TIP.maxDeposit + (this.tipCounter[tip] % len)] || CellType.Leaf] as CellKind;
+    this.tipCounter[tip]++;
+    const left: DesignCell = { q: oq, r: or, kind, push: (dir + 3) % 6, strength: blobJetStrength(g.design) };
+    const id = this.addCell(cells, tip, g, left, ox, oy, frame, o);
+    if (id >= 0) {
+      for (const n of this.adjacent(oq, or, occ)) this.addBond(n, id, 2 * CELL.radius);
+      occ.set(hexKey(oq, or), id);
+      cells.push(id);
+    }
+    for (const n of this.adjacent(fq, fr, occ)) if (n !== id) this.addBond(n, tip, 2 * CELL.radius);
+    // If anything failed to attach, the split check sorts out the pieces.
+    this.dirtyOrgs.add(o);
+    // Branch: a new tip beside the cell just left behind, facing out to that side (alternating sides).
+    this.tipSinceBranch[tip]++;
+    if (
+      id >= 0 &&
+      this.tipSignal[tip * 3 + 2] > TIP.branchThreshold &&
+      this.tipSinceBranch[tip] >= TIP.branchCooldown &&
+      cells.length < g.maxCells &&
+      this.poolCanPay(cells, growEnergy, growNutrient)
+    ) {
+      const side = (dir + (this.tipCounter[tip] % 2 ? 1 : 5)) % 6;
+      const bq = oq + HEX_DIRS[side][0];
+      const br = or + HEX_DIRS[side][1];
+      const [bx, by] = this.placeNear(id, bq, br, frame);
+      if (!occ.has(hexKey(bq, br)) && this.spotFree(bx, by)) {
+        const branch: DesignCell = { q: bq, r: br, kind: 'tip', ...this.tipSettings(tip), index: this.planSlot[tip] >= 0 ? this.planSlot[tip] : undefined };
+        const b = this.addCell(cells, id, g, branch, bx, by, frame, o);
+        if (b >= 0) {
+          this.tipDir[b] = side;
+          for (const n of this.adjacent(bq, br, occ)) this.addBond(n, b, 2 * CELL.radius);
+          occ.set(hexKey(bq, br), b);
+          cells.push(b);
+          this.tipSinceBranch[tip] = 0;
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Worm: once its body is complete, adds a whole segment between the last
+   * segment and the tail in one step. The tail moves back by one segment
+   * (layout and position), its bonds to the body are rebuilt, and the new
+   * segment's cells fill the gap. Paid from the whole organism.
+   */
+  private insertSegment(o: number, g: Genome, cells: number[], occ: Map<number, number>): void {
+    const worm = g.worm!;
+    const k = this.orgSegments[o];
+    if (k >= worm.maxSegments) return;
+    const { growEnergy, growNutrient } = g.design;
+    const size = worm.segmentSize;
+    if (cells.length + size > g.maxCells || !this.poolCanPay(cells, growEnergy * size, growNutrient * size)) return;
+    const next = worm.plans[k + 1];
+    const current = new Set(this.planOf(o).map((c) => c.index));
+    const tail = cells.filter((i) => worm.tail.has(this.planSlot[i]));
+    const anchor = cells.find((i) => !worm.tail.has(this.planSlot[i]));
+    if (anchor === undefined) return;
+    const frame = this.frameAngle(anchor, occ);
+    // Move the tail to its spot in the longer body.
+    for (const i of tail) {
+      while (this.bondDeg[i] > 0) this.freeBond(this.cellBonds[i * BOND_SLOTS]);
+      occ.delete(hexKey(this.hexQ[i], this.hexR[i]));
+    }
+    const bySlot = new Map(next.map((c) => [c.index, c]));
+    for (const i of tail) {
+      const spot = bySlot.get(this.planSlot[i]);
+      if (!spot) continue;
+      const [px, py] = this.placeNear(anchor, spot.q, spot.r, frame);
+      this.setHex(i, spot.q, spot.r);
+      this.x[i] = px;
+      this.y[i] = py;
+    }
+    for (const i of tail) occ.set(hexKey(this.hexQ[i], this.hexR[i]), i);
+    this.orgSegments[o] = k + 1;
+    // The new segment's cells.
+    for (const spot of next) {
+      if (current.has(spot.index) || occ.has(hexKey(spot.q, spot.r))) continue;
+      const [px, py] = this.placeNear(anchor, spot.q, spot.r, frame);
+      const id = this.addCell(cells, anchor, g, spot, px, py, frame, o);
+      if (id < 0) break;
+      occ.set(hexKey(spot.q, spot.r), id);
+      cells.push(id);
+      for (const n of this.adjacent(spot.q, spot.r, occ)) if (n !== id) this.addBond(n, id, 2 * CELL.radius);
+    }
+    this.dirtyOrgs.add(o);
+    // Rebond the tail to whatever now neighbors it.
+    for (const i of tail) {
+      for (const n of this.adjacent(this.hexQ[i], this.hexR[i], occ)) {
+        if (n === i || this.bonded(i, n)) continue;
+        this.addBond(n, i, 2 * CELL.radius);
+      }
+    }
+  }
+
+  /** Whether two cells share a bond. */
+  private bonded(a: number, b: number): boolean {
+    for (let k = 0; k < this.bondDeg[a]; k++) if (this.bondOther(this.cellBonds[a * BOND_SLOTS + k], a) === b) return true;
+    return false;
   }
 
   /** A cell kind for Blob growth, in proportion to the kinds in the body. */
@@ -1141,16 +1597,16 @@ export class Sim {
   }
 
   /**
-   * Spends the parent's stored energy and nutrient on a new cell. The nutrient
-   * becomes the new body (surplus goes to its store); part of the energy is
-   * lost and the rest becomes the new cell's energy.
+   * Spends the organism's stored energy and nutrient on a new cell (`parent`
+   * pays first, then the rest of `payers`). The nutrient becomes the new body
+   * (surplus goes to its store); part of the energy is lost and the rest
+   * becomes the new cell's energy.
    */
-  private addCell(parent: number, g: Genome, slot: DesignCell, px: number, py: number, frame: number, org: number): number {
+  private addCell(payers: number[], parent: number, g: Genome, slot: DesignCell, px: number, py: number, frame: number, org: number): number {
     const id = this.allocCell();
     if (id < 0) return -1;
     const { growEnergy, growNutrient } = g.design;
-    this.energy[parent] -= growEnergy;
-    this.storedNutrient[parent] -= growNutrient;
+    this.poolPay(payers, parent, growEnergy, growNutrient);
     if (this.organism[parent] === org) this.orgCells[org]++;
     const stored = growNutrient - CELL.bodyNutrient;
     this.initCell(id, slot, px, py, frame, growEnergy * (1 - GROWTH.energyLoss), org, stored);
@@ -1172,8 +1628,17 @@ export class Sim {
 
   /** Bud: a cell that can pay releases one unbonded starter cell that grows the full design from scratch. */
   private bud(o: number, g: Genome, cells: number[], occ: Map<number, number>): void {
-    const source = cells.find((i) => this.canPay(i, g));
-    if (source === undefined) return;
+    if (!this.poolCanPay(cells, g.design.growEnergy, g.design.growNutrient)) return;
+    // Bud from a random cell with a free spot next to it.
+    const startAt = Math.floor(this.rng() * cells.length);
+    for (let c = 0; c < cells.length; c++) {
+      const source = cells[(startAt + c) % cells.length];
+      if (this.budFrom(o, g, cells, occ, source)) return;
+    }
+  }
+
+  /** Tries to bud from one cell; true if a bud was released. */
+  private budFrom(o: number, g: Genome, cells: number[], occ: Map<number, number>, source: number): boolean {
     const frame = this.frameAngle(source, occ);
     const offset = Math.floor(this.rng() * 6);
     for (let k = 0; k < 6; k++) {
@@ -1184,18 +1649,20 @@ export class Sim {
       const [px, py] = this.placeNear(source, q, r, frame);
       if (!this.spotFree(px, py)) continue;
       const child = this.allocOrg();
-      if (child < 0) return;
+      if (child < 0) return true;
       this.owner[child] = this.owner[o];
       this.lineage[child] = this.lineage[o];
       this.inherit(o, child, true);
       this.orgCells[child] = 1;
+      this.orgSegments[child] = 1;
       // The bud grows its own (possibly mutated) design from that design's starter.
       const starter = this.genomes[this.genomeId[child]].plan[0];
-      const id = this.addCell(source, g, starter, px, py, this.rng() * Math.PI * 2, child);
+      const id = this.addCell(cells, source, g, starter, px, py, this.rng() * Math.PI * 2, child);
       if (id < 0) {
         this.freeOrg(child);
-        return;
+        return true;
       }
+      this.provision(cells, source, id);
       // Launch: shoot the bud away from the cell it budded from.
       const speed = (g.design.launch ?? 0) * GROWTH.launchSpeed;
       if (speed > 0) {
@@ -1203,8 +1670,24 @@ export class Sim {
         this.vx[id] = ((px - this.x[source]) / len) * speed;
         this.vy[id] = ((py - this.y[source]) / len) * speed;
       }
-      return;
+      return true;
     }
+    return false;
+  }
+
+  /** A new bud also gets a share of the parent organism's spare energy and stored nutrient, up to its caps. */
+  private provision(cells: number[], source: number, bud: number): void {
+    let spareE = 0;
+    let stored = 0;
+    for (const c of cells) {
+      spareE += this.spareEnergy(c);
+      stored += this.storedNutrient[c];
+    }
+    const e = Math.min(spareE * GROWTH.budShare, energyCap(this.type[bud]) - this.energy[bud]);
+    const n = Math.min(Math.floor(stored * GROWTH.budShare), storedCap(this.type[bud]) - this.storedNutrient[bud]);
+    this.poolPay(cells, source, Math.max(0, e), Math.max(0, n));
+    this.energy[bud] += Math.max(0, e);
+    this.storedNutrient[bud] += Math.max(0, n);
   }
 
   /**
@@ -1227,18 +1710,6 @@ export class Sim {
       }
       seeds.push(best);
     }
-    const adj = new Map<number, number[]>();
-    const orgBonds: number[] = [];
-    for (let b = 0; b < this.bondCount; b++) {
-      const a = this.bondA[b];
-      if (a < 0 || this.organism[a] !== o) continue;
-      const c = this.bondB[b];
-      orgBonds.push(b);
-      if (!adj.has(a)) adj.set(a, []);
-      if (!adj.has(c)) adj.set(c, []);
-      adj.get(a)!.push(c);
-      adj.get(c)!.push(a);
-    }
     const region = new Map<number, number>();
     const queue: number[] = [];
     seeds.forEach((s, k) => {
@@ -1247,15 +1718,21 @@ export class Sim {
     });
     for (let h = 0; h < queue.length; h++) {
       const i = queue[h];
-      for (const n of adj.get(i) ?? []) {
-        if (region.has(n)) continue;
+      for (let k = 0; k < this.bondDeg[i]; k++) {
+        const n = this.bondOther(this.cellBonds[i * BOND_SLOTS + k], i);
+        if (this.organism[n] !== o || region.has(n)) continue;
         region.set(n, region.get(i)!);
         queue.push(n);
       }
     }
-    for (const b of orgBonds) {
-      if (region.get(this.bondA[b]) !== region.get(this.bondB[b])) this.freeBond(b);
+    const cut: number[] = [];
+    for (const i of cells) {
+      for (let k = 0; k < this.bondDeg[i]; k++) {
+        const b = this.cellBonds[i * BOND_SLOTS + k];
+        if (this.bondA[b] === i && region.get(this.bondA[b]) !== region.get(this.bondB[b])) cut.push(b);
+      }
     }
+    for (const b of cut) this.freeBond(b);
     this.dirtyOrgs.add(o);
     this.reproducing.add(o);
   }
@@ -1296,7 +1773,7 @@ export class Sim {
     const { x, y, vx, vy, oldX, oldY, type, pinned } = this;
     this.updatePinned();
     const cur = { x: 0, y: 0 };
-    const field: CurrentField = { dir: this.world.currentDir, strength: this.world.currentStrength };
+    const field = this.currents();
     for (let i = 0; i < n; i++) {
       if (type[i] === CellType.None) continue;
       oldX[i] = x[i];
@@ -1307,6 +1784,12 @@ export class Sim {
         continue;
       }
       sampleCurrent(field, x[i], y[i], cur);
+      if (type[i] === CellType.Dead) {
+        // Marine snow: dead cells drift toward deeper water.
+        const tile = this.tileAt(x[i], y[i]);
+        cur.x += this.sinkX[tile];
+        cur.y += this.sinkY[tile];
+      }
       vx[i] = vx[i] * PHYSICS.drag + cur.x * (1 - PHYSICS.drag);
       vy[i] = vy[i] * PHYSICS.drag + cur.y * (1 - PHYSICS.drag);
       x[i] += vx[i] * dt;
@@ -1314,17 +1797,21 @@ export class Sim {
     }
 
     this.buildHash();
+    this.groupOrganisms();
     const r = CELL.radius;
     for (let it = 0; it < PHYSICS.iterations; it++) {
       for (let b = 0; b < this.bondCount; b++) {
         const a = this.bondA[b];
         if (a < 0) continue;
         const c = this.bondB[b];
+        const pa = pinned[a];
+        const pc = pinned[c];
+        if (pa && pc) continue;
+        const wa = pa ? 0 : pc ? 1 : 0.5;
+        const wc = pc ? 0 : pa ? 1 : 0.5;
         const dx = x[c] - x[a];
         const dy = y[c] - y[a];
-        const d = Math.hypot(dx, dy) || 1e-6;
-        const [wa, wc] = this.weights(a, c);
-        if (wa + wc === 0) continue;
+        const d = Math.sqrt(dx * dx + dy * dy) || 1e-6;
         const k = ((d - this.bondRest[b]) / d) * BONDS.stiffness;
         x[a] += dx * k * wa;
         y[a] += dy * k * wa;
@@ -1332,12 +1819,12 @@ export class Sim {
         y[c] -= dy * k * wc;
       }
       this.matchShapes();
-      this.solveContacts(2 * r);
-      for (let i = 0; i < n; i++) {
-        if (type[i] === CellType.None || pinned[i]) continue;
-        x[i] = Math.min(this.worldWidth - r, Math.max(r, x[i]));
-        y[i] = Math.min(this.worldHeight - r, Math.max(r, y[i]));
-      }
+      this.solveContacts(2 * r, it === 0);
+    }
+    for (let i = 0; i < n; i++) {
+      if (type[i] === CellType.None || pinned[i]) continue;
+      x[i] = Math.min(this.worldWidth - r, Math.max(r, x[i]));
+      y[i] = Math.min(this.worldHeight - r, Math.max(r, y[i]));
     }
 
     for (let i = 0; i < n; i++) {
@@ -1356,9 +1843,9 @@ export class Sim {
   private matchShapes(): void {
     const k = BONDS.shapeStiffness;
     if (k <= 0) return;
-    const { start, list } = this.cellsByOrganism();
-    const d = 2 * CELL.radius;
-    const { x, y, pinned } = this;
+    const start = this.orgStart;
+    const list = this.orgList;
+    const { x, y, pinned, restX, restY } = this;
     for (let o = 0; o < this.orgCount; o++) {
       const a = start[o];
       const b = start[o + 1];
@@ -1374,9 +1861,8 @@ export class Sim {
       let cy = 0;
       for (let n = a; n < b; n++) {
         const i = list[n];
-        const [lx, ly] = hexToLocal(this.hexQ[i], this.hexR[i]);
-        rx += lx * d;
-        ry += ly * d;
+        rx += restX[i];
+        ry += restY[i];
         cx += x[i];
         cy += y[i];
       }
@@ -1390,9 +1876,8 @@ export class Sim {
       let cross = 0;
       for (let n = a; n < b; n++) {
         const i = list[n];
-        const [lx, ly] = hexToLocal(this.hexQ[i], this.hexR[i]);
-        const px = lx * d - rx;
-        const py = ly * d - ry;
+        const px = restX[i] - rx;
+        const py = restY[i] - ry;
         const qx = x[i] - cx;
         const qy = y[i] - cy;
         dot += px * qx + py * qy;
@@ -1405,9 +1890,8 @@ export class Sim {
       for (let n = a; n < b; n++) {
         const i = list[n];
         if (pinned[i]) continue;
-        const [lx, ly] = hexToLocal(this.hexQ[i], this.hexR[i]);
-        const px = lx * d - rx;
-        const py = ly * d - ry;
+        const px = restX[i] - rx;
+        const py = restY[i] - ry;
         x[i] += (cx + px * c - py * s - x[i]) * k;
         y[i] += (cy + px * s + py * c - y[i]) * k;
       }
@@ -1423,16 +1907,6 @@ export class Sim {
     this.orgAngle[o] = angle;
   }
 
-  /** Share of a correction each cell takes: half each, or all of it for the free one when the other is anchored. */
-  private weights(a: number, b: number): [number, number] {
-    const pa = this.pinned[a];
-    const pb = this.pinned[b];
-    if (pa && pb) return [0, 0];
-    if (pa) return [0, 1];
-    if (pb) return [1, 0];
-    return [0.5, 0.5];
-  }
-
   private bucketOf(px: number, py: number): [number, number] {
     const size = this.bucket;
     return [
@@ -1443,47 +1917,113 @@ export class Sim {
 
   private buildHash(): void {
     this.hashHead.fill(-1);
+    const size = this.bucket;
+    const cols = this.hashCols;
+    const rows = this.hashRows;
     for (let i = 0; i < this.cellCount; i++) {
       if (this.type[i] === CellType.None) continue;
-      const [bx, by] = this.bucketOf(this.x[i], this.y[i]);
-      const h = by * this.hashCols + bx;
+      const bx = Math.min(cols - 1, Math.max(0, Math.floor(this.x[i] / size)));
+      const by = Math.min(rows - 1, Math.max(0, Math.floor(this.y[i] / size)));
+      const h = by * cols + bx;
       this.hashNext[i] = this.hashHead[h];
       this.hashHead[h] = i;
     }
   }
 
-  private solveContacts(minDist: number): void {
-    const { x, y } = this;
+  /**
+   * Pushes overlapping cells apart. Cells are sorted by a grid of contact-size
+   * buckets (once per tick, on the first pass) and solved on copies of their
+   * positions in that order, so neighbors sit close in memory. Each pair is
+   * visited once: within a bucket, and against the four buckets ahead of it.
+   * The correction is split evenly, or taken entirely by the free cell when
+   * the other is anchored.
+   */
+  private solveContacts(minDist: number, sort: boolean): void {
+    const { x, y, type, pinned } = this;
+    const ids = this.sortedIds;
+    const sx = this.sortedX;
+    const sy = this.sortedY;
+    const sp = this.sortedPinned;
+    const start = this.contactStart;
+    const cols = this.contactCols;
+    const rows = this.contactRows;
+    const buckets = cols * rows;
+    if (sort) {
+      // Counting sort of cells by bucket.
+      start.fill(0);
+      for (let i = 0; i < this.cellCount; i++) {
+        if (type[i] === CellType.None) continue;
+        start[this.contactBucket(x[i], y[i]) + 1]++;
+      }
+      for (let b = 0; b < buckets; b++) start[b + 1] += start[b];
+      if (this.contactFill.length < buckets) this.contactFill = new Int32Array(buckets);
+      const fill = this.contactFill;
+      fill.set(start.subarray(0, buckets));
+      for (let i = 0; i < this.cellCount; i++) {
+        if (type[i] === CellType.None) continue;
+        ids[fill[this.contactBucket(x[i], y[i])]++] = i;
+      }
+    }
+    const n = start[buckets];
+    for (let k = 0; k < n; k++) {
+      const i = ids[k];
+      sx[k] = x[i];
+      sy[k] = y[i];
+      sp[k] = pinned[i];
+    }
     const min2 = minDist * minDist;
-    for (let i = 0; i < this.cellCount; i++) {
-      if (this.type[i] === CellType.None) continue;
-      const [bx, by] = this.bucketOf(x[i], y[i]);
-      for (let oy = -1; oy <= 1; oy++) {
-        const ry = by + oy;
-        if (ry < 0 || ry >= this.hashRows) continue;
-        for (let ox = -1; ox <= 1; ox++) {
-          const rx = bx + ox;
-          if (rx < 0 || rx >= this.hashCols) continue;
-          for (let j = this.hashHead[ry * this.hashCols + rx]; j >= 0; j = this.hashNext[j]) {
-            if (j <= i) continue;
-            const dx = x[j] - x[i];
-            const dy = y[j] - y[i];
-            const d2 = dx * dx + dy * dy;
-            if (d2 >= min2) continue;
-            const d = Math.sqrt(d2);
-            // Exactly overlapping cells get pushed apart along an arbitrary axis.
-            const ux = d > 1e-6 ? dx / d : 1;
-            const uy = d > 1e-6 ? dy / d : 0;
-            const [wi, wj] = this.weights(i, j);
-            const push = minDist - d;
-            x[i] -= ux * push * wi;
-            y[i] -= uy * push * wi;
-            x[j] += ux * push * wj;
-            y[j] += uy * push * wj;
-          }
+    const pair = (a: number, b: number) => {
+      const dx = sx[b] - sx[a];
+      const dy = sy[b] - sy[a];
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= min2) return;
+      const pa = sp[a];
+      const pb = sp[b];
+      if (pa && pb) return;
+      const wa = pa ? 0 : pb ? 1 : 0.5;
+      const wb = pb ? 0 : pa ? 1 : 0.5;
+      const d = Math.sqrt(d2);
+      // Exactly overlapping cells get pushed apart along an arbitrary axis.
+      const ux = d > 1e-6 ? dx / d : 1;
+      const uy = d > 1e-6 ? dy / d : 0;
+      const push = minDist - d;
+      sx[a] -= ux * push * wa;
+      sy[a] -= uy * push * wa;
+      sx[b] += ux * push * wb;
+      sy[b] += uy * push * wb;
+    };
+    for (let by = 0; by < rows; by++) {
+      for (let bx = 0; bx < cols; bx++) {
+        const b = by * cols + bx;
+        const a0 = start[b];
+        const a1 = start[b + 1];
+        if (a0 === a1) continue;
+        for (let a = a0; a < a1; a++) {
+          for (let c = a + 1; c < a1; c++) pair(a, c);
+        }
+        // Forward neighbors: right, and the three buckets in the row below.
+        const right = bx + 1 < cols;
+        const down = by + 1 < rows;
+        if (right) for (let a = a0; a < a1; a++) for (let c = start[b + 1]; c < start[b + 2]; c++) pair(a, c);
+        if (down) {
+          const lo = b + cols + (bx > 0 ? -1 : 0);
+          const hi = b + cols + (right ? 1 : 0);
+          for (let a = a0; a < a1; a++) for (let c = start[lo]; c < start[hi + 1]; c++) pair(a, c);
         }
       }
     }
+    for (let k = 0; k < n; k++) {
+      const i = ids[k];
+      x[i] = sx[k];
+      y[i] = sy[k];
+    }
+  }
+
+  private contactBucket(px: number, py: number): number {
+    const size = 2 * CELL.radius;
+    const bx = Math.min(this.contactCols - 1, Math.max(0, Math.floor(px / size)));
+    const by = Math.min(this.contactRows - 1, Math.max(0, Math.floor(py / size)));
+    return by * this.contactCols + bx;
   }
 
   // ------------------------------------------------------------- allocation
@@ -1502,7 +2042,26 @@ export class Sim {
     this.jetPush[id] = type === CellType.Jet || isSensorType(type) ? (slot.push ?? -1) : -1;
     this.jetStrength[id] = type === CellType.Jet ? jetStrength(slot) : 0;
     this.planSlot[id] = slot.index ?? -1;
-    this.proxFilter[id] = type === CellType.ProximitySensor && slot.filter ? KIND_TYPE[slot.filter] : 0;
+    this.proxFilter[id] =
+      type === CellType.ProximitySensor && slot.filter ? (slot.filter === 'dead' ? CellType.Dead : KIND_TYPE[slot.filter]) : 0;
+    if (type === CellType.Tip) {
+      // Grows outward from the cell it's attached to, unless the slot says otherwise.
+      this.tipDir[id] = slot.push !== undefined && slot.push >= 0 ? (slot.push + 3) % 6 : 0;
+      this.tipBase[id * 3] = tipGrow(slot);
+      this.tipBase[id * 3 + 1] = slot.turn ?? 0;
+      this.tipBase[id * 3 + 2] = slot.branch ?? 0;
+      for (let c = 0; c < 3; c++) this.tipSignal[id * 3 + c] = this.tipBase[id * 3 + c];
+      const dep = tipDeposit(slot).slice(0, TIP.maxDeposit);
+      dep.forEach((k, n) => (this.tipDeposit[id * TIP.maxDeposit + n] = KIND_TYPE[k]));
+      this.tipDepositLen[id] = dep.length;
+      this.tipCounter[id] = 0;
+      this.tipSinceBranch[id] = 0;
+    }
+    if (type === CellType.Timer) {
+      this.timerCycles[id] = timerCycles(slot);
+      this.timerPhase[id] = timerPhase(slot);
+      this.timerDuty[id] = timerDuty(slot);
+    }
     this.neuronOut[id] = this.neuronPrev[id] = this.neuronNoise[id] = 0;
     if (type === CellType.Neuron) {
       this.neuronBias[id] = neuronBias(slot);
@@ -1527,8 +2086,8 @@ export class Sim {
     this.organism[id] = org;
     this.cellLineage[id] = this.lineage[org];
     this.spikedAt[id] = -1e9;
-    this.hexQ[id] = q;
-    this.hexR[id] = r;
+    this.setHex(id, q, r);
+    this.bondDeg[id] = 0;
     this.emit(CellEvent.Born, id);
   }
 
@@ -1546,19 +2105,47 @@ export class Sim {
   }
 
   private addBond(a: number, b: number, rest: number): void {
+    if (this.bondDeg[a] >= BOND_SLOTS || this.bondDeg[b] >= BOND_SLOTS) return;
     const id = this.freeBonds.length > 0 ? this.freeBonds.pop()! : this.bondCount < SIM.maxBonds ? this.bondCount++ : -1;
     if (id < 0) return;
     this.bondA[id] = a;
     this.bondB[id] = b;
     this.bondRest[id] = rest;
+    this.cellBonds[a * BOND_SLOTS + this.bondDeg[a]++] = id;
+    this.cellBonds[b * BOND_SLOTS + this.bondDeg[b]++] = id;
     this.events.push(CellEvent.BondAdded, a, b, 0, 0, 0, 0, 0, 0, 0, 0);
   }
 
   private freeBond(b: number): void {
-    this.events.push(CellEvent.BondRemoved, this.bondA[b], this.bondB[b], 0, 0, 0, 0, 0, 0, 0, 0);
+    const a = this.bondA[b];
+    const c = this.bondB[b];
+    this.events.push(CellEvent.BondRemoved, a, c, 0, 0, 0, 0, 0, 0, 0, 0);
+    this.unlinkBond(a, b);
+    this.unlinkBond(c, b);
     this.bondA[b] = -1;
     this.bondB[b] = -1;
     this.freeBonds.push(b);
+  }
+
+  /** Removes bond b from cell i's bond list. */
+  private unlinkBond(i: number, b: number): void {
+    const base = i * BOND_SLOTS;
+    const last = --this.bondDeg[i];
+    for (let k = 0; k <= last; k++) {
+      if (this.cellBonds[base + k] === b) {
+        this.cellBonds[base + k] = this.cellBonds[base + last];
+        return;
+      }
+    }
+  }
+
+  /** Sets a cell's spot in its organism's hex layout (and its cached rest offset). */
+  private setHex(i: number, q: number, r: number): void {
+    this.hexQ[i] = q;
+    this.hexR[i] = r;
+    const d = 2 * CELL.radius;
+    this.restX[i] = (q + r / 2) * d;
+    this.restY[i] = r * SQRT3_2 * d;
   }
 
   private emit(kind: number, i: number): void {
@@ -1575,7 +2162,12 @@ export class Sim {
 
   private allocOrg(): number {
     const o = this.freeOrgs.length > 0 ? this.freeOrgs.pop()! : this.orgCount < SIM.maxOrganisms ? this.orgCount++ : -1;
-    if (o >= 0) this.orgAngleTick[o] = -10;
+    if (o >= 0) {
+      this.orgAngleTick[o] = -10;
+      this.orgSegments[o] = 1;
+      this.orgTipTurn[o] = 0;
+      this.orgTipStuck[o] = 0;
+    }
     return o;
   }
 

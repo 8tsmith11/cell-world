@@ -22,6 +22,9 @@ export interface WorldMsg {
   temperature: Float32Array;
   currentDir: Float32Array;
   currentStrength: Float32Array;
+  currentVx: Float32Array;
+  currentVy: Float32Array;
+  chem: Float32Array;
 }
 
 export interface OrganismInfo {
@@ -58,6 +61,8 @@ export interface CellInfo {
   sensorLevel: number;
   sensorChange: number;
   neuronOutput: number;
+  /** Growth tips: Grow, Turn and Branch signals. */
+  tipSignal: [number, number, number];
   org: OrganismInfo | null;
 }
 
@@ -91,7 +96,10 @@ export interface FrameMsg {
   cellOwner: Int32Array;
   /** Cell events since the previous frame (see CellEvent in sim.ts). */
   events: Float32Array;
-  waterNutrient: Uint32Array;
+  /** Water nutrient per tile, sent every SIM.waterFrameEvery ticks (null in between). */
+  waterNutrient: Uint32Array | null;
+  /** Average simulation time per tick over the last interval, in milliseconds. */
+  stepMs: number;
   living: number;
   dead: number;
   organisms: number;

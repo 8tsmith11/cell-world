@@ -1,12 +1,13 @@
 import { Application, Container } from 'pixi.js';
 import { CAMERA, CURRENTS, DEPTH, FEED, LIGHT, NUTRIENT, OVERLAY, SIM, TEMPERATURE, WORLD } from './config';
-import type { GameSource, RenderCells, SpawnChoice } from './game-source';
+import type { GameSource, RenderCells, SpawnChoice, StaticWorld } from './game-source';
 import { type Design, releaseCost } from './sim/genome';
 import { Camera } from './render/camera';
 import { CellView } from './render/cells';
 import { Streaks } from './render/streaks';
+import { Vents } from './render/vents';
 import { OVERLAYS, Water, type Overlay } from './render/water';
-import { sampleCurrent } from './sim/currents';
+import { type CurrentField, sampleCurrent } from './sim/currents';
 import type { CellInfo } from './sim/protocol';
 import { CELL_TYPE_NAMES, CellType, energyCap, storedCap } from './sim/sim';
 import { dayPhase, daylight } from './sim/world';
@@ -28,15 +29,15 @@ function legendHtml(o: Overlay): string {
   const ends = (...labels: string[]) => `<div class="ends">${labels.map((l) => `<span>${l}</span>`).join('')}</div>`;
   switch (o) {
     case 'currents':
-      return `<div class="title">Currents</div>${bar('#0a1a1e', css(OVERLAY.streakColor))}${ends('calm', `strong · ${CURRENTS.streamSpeed} u/s`)}<div class="note">streaks flow with the water</div>`;
+      return `<div class="title">Currents</div>${bar('#0a1a1e', css(OVERLAY.streakColor))}${ends('calm', `strong · ${CURRENTS.maxSpeed} u/s`)}<div class="note">streaks flow with the water</div>`;
     case 'nutrient':
       return `<div class="title">Nutrient in water</div>${bar('#050403', css(OVERLAY.nutrientColor))}${ends('depleted', 'even', 'rich')}`;
     case 'temperature':
-      return `<div class="title">Temperature</div>${bar(css(OVERLAY.coolColor), css(OVERLAY.warmColor))}${ends(`${TEMPERATURE.edge}°C`, `${TEMPERATURE.center}°C`)}<div class="note">lines every ${OVERLAY.isothermStep}°C</div>`;
+      return `<div class="title">Temperature</div>${bar(css(OVERLAY.coolColor), css(OVERLAY.warmColor))}${ends(`${TEMPERATURE.edge - TEMPERATURE.depthCooling}°C`, `${TEMPERATURE.center}°C`)}<div class="note">lines every ${OVERLAY.isothermStep}°C</div>`;
     case 'depth':
       return `<div class="title">Depth</div><div class="note">contours every ${OVERLAY.contourMinor} m · bold every ${OVERLAY.contourMajor} m</div>${ends(`${DEPTH.min} m`, `${DEPTH.max} m`)}`;
     case 'light':
-      return `<div class="title">Light</div>${bar('#000000', css(OVERLAY.lightColor))}${ends('dark', 'full sun')}<div class="note">changes with time of day and depth</div>`;
+      return `<div class="title">Light</div>${bar('#000000', css(OVERLAY.lightColor))}${ends('dark', 'full sun')}<div class="note">changes with time of day and depth · warm glows are vents (energy for Chemosynths)</div>`;
     default:
       return '';
   }
@@ -55,10 +56,15 @@ function cellLines(c: CellInfo): string[] {
     `angle      ${c.angle.toFixed(2)}`,
     `organism   ${c.organism}`,
   ];
-  if (c.type >= CellType.LightSensor && c.type <= CellType.ProximitySensor) {
+  if ((c.type >= CellType.LightSensor && c.type <= CellType.ProximitySensor) || c.type === CellType.Timer) {
     lines.push(`level      ${c.sensorLevel.toFixed(2)}`, `change     ${c.sensorChange >= 0 ? '+' : ''}${c.sensorChange.toFixed(2)}`);
   }
   if (c.type === CellType.Neuron) lines.push(`output     ${c.neuronOutput >= 0 ? '+' : ''}${c.neuronOutput.toFixed(2)}`);
+  if (c.type === CellType.Tip) {
+    const [grow, turn, branch] = c.tipSignal;
+    const sign = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`;
+    lines.push(`grow       ${sign(grow)}`, `turn       ${sign(turn)}`, `branch     ${sign(branch)}`);
+  }
   if (c.org) {
     lines.push(
       `owner      ${c.org.owner}`,
@@ -102,12 +108,18 @@ const DIAL_SVG = `<svg viewBox="0 0 44 44" width="44" height="44" aria-label="Ti
 </svg>`;
 
 /** The in-game view: rendering, camera, overlays, hover info, HUD. Same for host and clients. */
+/** The static world's current field, for sampling. */
+function worldCurrents(w: StaticWorld): CurrentField {
+  return { dir: w.currentDir, strength: w.currentStrength, vx: w.currentVx, vy: w.currentVy };
+}
+
 export class Game {
   private camera = new Camera(WORLD.width * WORLD.tileSize, WORLD.height * WORLD.tileSize);
   private worldLayer = new Container();
   private water = new Water();
   private cells = new CellView();
   private streaks = new Streaks();
+  private vents = new Vents();
   private overlay: Overlay = 'none';
   private buttons: HTMLButtonElement[] = [];
   private held = new Set<string>();
@@ -138,7 +150,7 @@ export class Game {
     private app: Application,
     private source: GameSource,
   ) {
-    this.worldLayer.addChild(this.water.mesh, this.streaks.container, this.cells.container);
+    this.worldLayer.addChild(this.water.mesh, this.vents.container, this.streaks.container, this.cells.container);
     app.stage.addChild(this.worldLayer);
     this.dial.innerHTML = DIAL_SVG;
     this.buildOverlayBar();
@@ -512,7 +524,8 @@ export class Game {
     if (src.world && src.worldVersion !== this.worldVersion) {
       this.worldVersion = src.worldVersion;
       this.water.setWorld(src.world.depth, src.world.temperature);
-      this.streaks.setField({ dir: src.world.currentDir, strength: src.world.currentStrength });
+      this.vents.setWorld(src.world.chem);
+      this.streaks.setField(worldCurrents(src.world));
       this.hoverId = -1;
       src.setHover(-1);
     }
@@ -534,9 +547,10 @@ export class Game {
     const time = src.time();
     const day = daylight(time);
     this.water.update(day, this.overlay);
+    this.vents.update(day);
     this.streaks.update(dt, this.overlay === 'currents', this.camera);
     const cells = src.cells(now);
-    if (cells) this.cells.draw(cells, day, this.hoverId, this.camera.zoom, (o) => src.playerColor(o));
+    if (cells) this.cells.draw(cells, day, this.hoverId, this.camera.zoom, (o) => src.playerColor(o), this.camera.viewRect());
     this.updateHover(day, cells);
     updateDial(this.dial, time);
     this.updatePanels(now);
@@ -569,7 +583,7 @@ export class Game {
     switch (this.overlay) {
       case 'currents': {
         const c = { x: 0, y: 0 };
-        sampleCurrent({ dir: world.currentDir, strength: world.currentStrength }, p.x, p.y, c);
+        sampleCurrent(worldCurrents(world), p.x, p.y, c);
         lines.push(`current     ${Math.hypot(c.x, c.y).toFixed(1)} u/s`);
         break;
       }
@@ -584,6 +598,7 @@ export class Game {
         break;
       case 'light':
         lines.push(`light       ${(day * Math.exp(-LIGHT.attenuation * world.depth[tile]) * 100).toFixed(0)}%`);
+        if (world.chem[tile] > 0.01) lines.push(`vent        ${(world.chem[tile] * 100).toFixed(0)}%`);
         break;
     }
     const info = this.hoverId >= 0 ? src.hoverInfo() : null;
@@ -616,6 +631,8 @@ export class Game {
         ? 'Nutrient  …'
         : `Nutrient  ${total.toLocaleString()} = water ${stats!.water.toLocaleString()} + cells ${stats!.cells.toLocaleString()}${total !== NUTRIENT.total ? '  DRIFT!' : ''}`,
     ];
+    const ms = src.stepMs();
+    if (ms !== null) lines.push(`Tick      ${ms.toFixed(1)} ms (budget ${(1000 / SIM.tickHz).toFixed(0)} ms)`);
     if (src.isHost) lines.push('', '<span class="debug">R reroll · click water: spawn · Space pause · N step</span>');
     this.hud.innerHTML = lines.join('\n');
     this.hud.style.display = 'block';
